@@ -8,6 +8,7 @@ using PEtab, DataFrames, CSV
 using Optimization, Optim, OptimizationOptimJL
 using SymbolicUtils, Symbolics
 using Random
+using OrdinaryDiffEq  # For QNDF solver
 
 # ============================================================================
 # CONFIGURATION - Edit paths as needed
@@ -87,32 +88,59 @@ function load_petab_from_files()
     end
     
     # 5. Build observables dictionary
-    @parameters sf_pSTAT1 sigma_pSTAT1  # Declare observable parameters
-    
+    # We dynamically identify scale factors and noise parameters from observables_df
     observables = Dict{String, PEtabObservable}()
+    
     for row in eachrow(observables_df)
         obs_id = row.observableId
+        formula = row.observableFormula
+        noise_formula = row.noiseFormula
         
-        # Find the model observable
+        # 1. Resolve State/Observable from model (e.g., total_pS1)
+        # Extract the part after "sf_XYZ * "
+        m_obs = match(r"sf_\w+\s*\*\s*(\w+)", formula)
+        if isnothing(m_obs)
+            @warn "Could not parse observable formula: $formula. Trying fallback."
+            base_obs_name = formula # Fallback
+        else
+            base_obs_name = m_obs.captures[1]
+        end
+        
         model_obs_sym = nothing
-        obs_name = replace(row.observableFormula, r"sf_\w+ \* " => "")  # Extract base observable name
         for obs_eq in observed(rsys)
             obs_lhs_str = string(obs_eq.lhs)
-            if contains(obs_lhs_str, obs_name)
+            if contains(obs_lhs_str, base_obs_name)
                 model_obs_sym = obs_eq.rhs
                 break
             end
         end
         
         if isnothing(model_obs_sym)
-            @warn "Could not find observable '$obs_name' in model, using placeholder"
-            model_obs_sym = species(rsys)[1]
+            error("Could not find observable '$base_obs_name' in model.")
         end
         
-        # Parse noise formula
-        noise_param = Symbol(row.noiseFormula)
+        # 2. Resolve Scale Factor (e.g., sf_pSTAT1) - use @parameters for symbolic
+        m_sf = match(r"(sf_\w+)\s*\*", formula)
         
-        observables[obs_id] = PEtabObservable(sf_pSTAT1 * model_obs_sym, noise_param)
+        # 3. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 4. Build observable expression with scale factor
+        if isnothing(m_sf)
+            obs_expr = model_obs_sym
+        else
+            # Use @parameters macro to create proper symbolic variable
+            sf_name = Symbol(m_sf.captures[1])
+            sf_param = only(@parameters $sf_name)
+            obs_expr = sf_param * model_obs_sym
+        end
+        
+        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
+        noise_expr = sigma_param * (obs_expr + 0.01)
+        
+        observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end
     
     # 6. Prepare measurements DataFrame for PEtab
@@ -129,7 +157,11 @@ function load_petab_from_files()
         verbose=true
     )
     
-    petab_problem = PEtabODEProblem(petab_model)
+    petab_problem = PEtabODEProblem(petab_model;
+        odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
+        sparse_jacobian=false,
+        gradient_method=:ForwardDiff
+    )
     
     println("✅ PEtab problem loaded successfully")
     println("  Parameters to estimate: $(length(petab_problem.lower_bounds))")

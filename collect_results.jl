@@ -22,15 +22,26 @@ using Colors
 using SciMLBase
 
 # Add IL6_TGFB src directory to LOAD_PATH to import analysis functions
-const IL6_SRC = "/net/dali/home/mscbio/ark426/Research/IL6_TGFB/src"
-if IL6_SRC ∉ LOAD_PATH
-    push!(LOAD_PATH, IL6_SRC)
+const IL6_SRC_CLUSTER = "/net/dali/home/mscbio/ark426/Research/IL6_TGFB/src"
+const IL6_SRC_LOCAL = "C:\\IL6_TGFB\\src"
+const IL6_SRC = isdir(IL6_SRC_CLUSTER) ? IL6_SRC_CLUSTER : 
+                isdir(IL6_SRC_LOCAL) ? IL6_SRC_LOCAL : nothing
+
+const HAS_IL6_TGFB = !isnothing(IL6_SRC)
+
+if HAS_IL6_TGFB
+    if IL6_SRC ∉ LOAD_PATH
+        push!(LOAD_PATH, IL6_SRC)
+    end
+    
+    # Import IL6_TGFB analysis modules
+    include(joinpath(IL6_SRC, "visualization.jl"))
+    include(joinpath(IL6_SRC, "identifiability.jl"))
+    include(joinpath(IL6_SRC, "profiling_plot.jl"))
+else
+    @warn "IL6_TGFB src not found - extended analysis (identifiability, profiling) will be skipped"
 end
 
-# Import IL6_TGFB analysis modules
-include(joinpath(IL6_SRC, "visualization.jl"))
-include(joinpath(IL6_SRC, "identifiability.jl"))
-include(joinpath(IL6_SRC, "profiling_plot.jl"))
 
 # ============================================================================
 # CONSTANTS
@@ -71,44 +82,48 @@ function extract_vector(x)
 end
 
 """
-    plot_waterfall(ms_result::MultistartResult)
+    plot_waterfall(ms_result::MultistartResult; metric=:fmin, title="Waterfall Plot", ylabel="Cost")
 
-Create PyPESTO-style waterfall plot from multistart results.
-Works with our local MultistartResult type.
+Create waterfall plot for a specific metric (fmin/NLLH, SSE, or ChiSq).
 """
-function plot_waterfall(ms_result)
-    plot_dir = joinpath(pwd(), "final_results_plots")
+function plot_waterfall(ms_result; metric=:fmin, title="Waterfall Plot", ylabel="Cost")
+    plot_dir = PLOTS_DIR
     mkpath(plot_dir)
-    save_path = joinpath(plot_dir, "waterfall_plot.png")
+    save_path = joinpath(plot_dir, "waterfall_plot_$(metric).png")
     
     # Extract finite objective values
-    objective_values = Float64[]
+    values = Float64[]
     for run in ms_result.runs
-        if isfinite(run.fmin) && !isnan(run.fmin)
-            push!(objective_values, run.fmin)
+        try
+            val = getfield(run, metric)
+            if isfinite(val)
+                push!(values, val)
+            end
+        catch
+            # Ignore missing fields
         end
     end
     
-    if isempty(objective_values)
-        @warn "No finite objective values found"
+    if isempty(values)
+        @warn "No finite values found for metric $metric"
         return nothing
     end
     
     # Sort for waterfall effect
-    sorted_values = sort(objective_values)
+    sorted_values = sort(values)
     n_runs = length(sorted_values)
     
-    println("Creating waterfall plot with $n_runs finite runs")
+    println("Creating waterfall plot for $metric with $n_runs finite runs")
     
     # Determine y-axis scaling
     y_min, y_max = extrema(sorted_values)
-    use_log_scale = (y_max / y_min) > 100
+    use_log_scale = (y_max / max(1e-10, y_min)) > 100
     
     # Create plot
     plt = plot(
-        title = "Waterfall plot",
+        title = title,
         xlabel = "Ordered optimizer run",
-        ylabel = "Function value",
+        ylabel = ylabel,
         size = (800, 500),
         dpi = 300,
         legend = false,
@@ -116,7 +131,7 @@ function plot_waterfall(ms_result)
     )
     
     # Plot connecting line
-    if use_log_scale
+    if use_log_scale && minimum(sorted_values) > 0
         plot!(plt, 1:n_runs, sorted_values,
               color = RGBA(0.7, 0.7, 0.7, 0.6),
               linewidth = 1,
@@ -130,7 +145,7 @@ function plot_waterfall(ms_result)
     end
     
     # Plot individual points with color coding
-    for (i, fval) in enumerate(sorted_values)
+    for (i, val) in enumerate(sorted_values)
         if i == 1
             point_color = :red
             marker_shape = :star
@@ -145,7 +160,7 @@ function plot_waterfall(ms_result)
             marker_size = 6
         end
         
-        scatter!(plt, [i], [fval],
+        scatter!(plt, [i], [val],
                 color = point_color,
                 markershape = marker_shape,
                 markersize = marker_size,
@@ -164,6 +179,95 @@ function plot_waterfall(ms_result)
     println("✅ Waterfall plot saved to: $save_path")
     
     return plt
+end
+
+"""
+    compute_metrics(petab_problem, theta_optim)
+
+Compute NLLH, ChiSq, and SSE for a parameter set.
+"""
+function compute_metrics(petab_problem, theta_optim)
+    # Use PEtab's internal function to get residuals (if available) or compute manually
+    
+    # We can use the cost function to get NLLH
+    nllh = try
+        petab_problem.nllh(theta_optim)
+    catch
+        NaN
+    end
+    
+    # To get SSE/ChiSq, we need individual residuals. 
+    ode_solutions = try
+         PEtab.solve_all_conditions(theta_optim, petab_problem, QNDF(); save_observed_t=true)
+    catch
+        nothing
+    end
+    
+    if isnothing(ode_solutions)
+        return (nllh=nllh, chisq=NaN, sse=NaN)
+    end
+    
+    mi = petab_problem.model_info
+    df = mi.petab_measurements
+    
+    chisq = 0.0
+    sse = 0.0
+    
+    cache = getfield(petab_problem.probinfo, :cache)
+    
+    for (sol_id, sol) in ode_solutions
+        # Skip failed simulations
+        if sol.retcode != :Success && string(sol.retcode) != "Success"
+            continue
+        end
+        
+        # Find measurements for this condition
+        cond_mask = (String.(hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id) .== string(sol_id))
+        
+        # We need to iterate over each measurement for this condition
+        cond_indices = findall(cond_mask)
+        
+        for idx in cond_indices
+            t = df.time[idx]
+            obs_id = df.observable_id[idx]
+            meas_val = df.measurement[idx]
+            
+            # Map parameters for this specific observation point
+            maprow = mi.xindices.mapxobservable[idx]
+            
+            # Dynamic states
+            xdyn, xobs, xnoise, xnond = PEtab.split_x(theta_optim, mi.xindices)
+            
+            xobs_ps = PEtab.transform_x(xobs, mi.xindices, :xobservable, cache)
+            xnoise_ps = PEtab.transform_x(xnoise, mi.xindices, :xnoise, cache)
+            xnond_ps = PEtab.transform_x(xnond, mi.xindices, :xnondynamic, cache)
+            
+            # Evaluate model at time t
+            try
+                u_t = sol(t)
+                
+                # Compute observation h
+                h_val = PEtab._h(u_t, t, sol.prob.p, xobs_ps, xnond_ps, 
+                            mi.model.h, maprow, obs_id,
+                            mi.petab_parameters.nominal_value)
+                            
+                # Compute sigma
+                sigma_val = PEtab._sigma(u_t, t, sol.prob.p, xnoise_ps, xnond_ps, 
+                                    mi.model.sigma, maprow, obs_id,
+                                    mi.petab_parameters.nominal_value)
+                
+                # Accumulate
+                res = meas_val - h_val
+                sse += res^2
+                chisq += (res / sigma_val)^2
+                
+            catch e
+                 # Skip point if eval fails
+            end
+        end
+    end
+    
+    return (nllh=nllh, chisq=chisq, sse=sse)
 end
 
 """
@@ -317,7 +421,7 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
                     color=marker_color,
                     title=cond_title,
                     xlabel= (idx > 10) ? "Time (min)" : "",  # Only bottom row
-                    ylabel= (mod(idx-1, n_cols) == 0) ? "pSTAT1" : "",  # Only left column
+                    ylabel= (mod(idx-1, n_cols) == 0) ? obs_id : "",  # Dynamic ylabel
                     legend=false,  # Remove per-subplot legend
                     titlefontsize=9,
                     guidefontsize=8,
@@ -340,40 +444,39 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
         println("  ✅ Saved: $save_path")
     end
     
-    # Also create a summary plot with select conditions
-    summary_plt = plot(layout=(2, 2), size=(800, 600), dpi=150,
-                       plot_title="Measurement Data Summary")
-    
-    select_conds = ["cond_il6_10", "cond_il10_10", "cond_il6_10_il10_10", "cond_il6_1_il10_1"]
-    colors_list = [:red, :blue, :purple, :orange]
-    
-    for (idx, cond_id) in enumerate(select_conds)
-        if idx > 4
-            break
+    # Also create a summary plot with select conditions for ALL observables
+    for obs_id in observables
+        summary_plt = plot(layout=(2, 2), size=(800, 600), dpi=150,
+                           plot_title="Data Summary: $obs_id")
+        
+        select_conds = ["cond_il6_10", "cond_il10_10", "cond_il6_10_il10_10", "cond_il6_1_il10_1"]
+        colors_list = [:red, :blue, :purple, :orange]
+        
+        for (idx, cond_id) in enumerate(select_conds)
+            if idx > 4 break end
+            
+            cond_meas = filter(row -> row.simulationConditionId == cond_id && row.observableId == obs_id, measurements)
+            if isempty(cond_meas) continue end
+            
+            times = Float64.(cond_meas.time)
+            meas_values = Float64.(cond_meas.measurement)
+            
+            scatter!(summary_plt, times, meas_values,
+                    subplot=idx,
+                    label="Data",
+                    marker=:circle,
+                    markersize=6,
+                    color=colors_list[idx],
+                    title=replace(cond_id, "cond_" => ""),
+                    xlabel="Time (min)",
+                    ylabel=obs_id,
+                    legend=:topright)
         end
         
-        cond_meas = filter(row -> row.simulationConditionId == cond_id, measurements)
-        if isempty(cond_meas)
-            continue
-        end
-        
-        times = Float64.(cond_meas.time)
-        meas_values = Float64.(cond_meas.measurement)
-        
-        scatter!(summary_plt, times, meas_values,
-                subplot=idx,
-                label="Data",
-                marker=:circle,
-                markersize=6,
-                color=colors_list[idx],
-                title=replace(cond_id, "cond_" => ""),
-                xlabel="Time (min)",
-                ylabel="pSTAT1",
-                legend=:topright)
+        summary_save_path = joinpath(plot_dir, "model_fit_summary_$(obs_id).png")
+        savefig(summary_plt, summary_save_path)
+        println("  ✅ Summary plot saved: $summary_save_path")
     end
-    
-    savefig(summary_plt, joinpath(plot_dir, "model_fit_summary.png"))
-    println("  ✅ Summary plot saved: model_fit_summary.png")
     
     return nothing
 end
@@ -434,15 +537,21 @@ function load_petab_problem()
         end
     end
     
-    # Build observables
-    @parameters sf_pSTAT1 sigma_pSTAT1
+    # Build observables dictionary
+    # We dynamically identify scale factors and noise parameters from observables_df
     observables = Dict{String, PEtabObservable}()
     for row in eachrow(observables_df)
         obs_id = row.observableId
-        obs_name = replace(row.observableFormula, r"sf_\w+ \* " => "")
+        formula = row.observableFormula
+        noise_formula = row.noiseFormula
+        
+        # 1. Resolve State/Observable from model (e.g., total_pS1)
+        m_obs = match(r"sf_\w+\s*\*\s*(\w+)", formula)
+        base_obs_name = isnothing(m_obs) ? formula : m_obs.captures[1]
+        
         model_obs_sym = nothing
         for obs_eq in observed(rsys)
-            if contains(string(obs_eq.lhs), obs_name)
+            if contains(string(obs_eq.lhs), base_obs_name)
                 model_obs_sym = obs_eq.rhs
                 break
             end
@@ -450,7 +559,30 @@ function load_petab_problem()
         if isnothing(model_obs_sym)
             model_obs_sym = species(rsys)[1]
         end
-        observables[obs_id] = PEtabObservable(sf_pSTAT1 * model_obs_sym, Symbol(row.noiseFormula))
+        
+        # 2. Resolve Scale Factor - use @parameters for symbolic
+        m_sf = match(r"(sf_\w+)\s*\*", formula)
+        
+        # 3. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 4. Build observable expression
+        if isnothing(m_sf)
+            # No scale factor, use model observable directly
+            obs_expr = model_obs_sym
+        else
+            # Create symbolic scale factor parameter
+            sf_name = Symbol(m_sf.captures[1])
+            sf_param = only(@parameters $sf_name)
+            obs_expr = sf_param * model_obs_sym
+        end
+        
+        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
+        noise_expr = sigma_param * (obs_expr + 0.01)
+        
+        observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end
     
     # Prepare measurements
@@ -463,7 +595,7 @@ function load_petab_problem()
         simulation_conditions=sim_conditions, verbose=false)
     
     return PEtabODEProblem(petab_model; 
-        odesolver=ODESolver(QNDF(); abstol=1e-8, reltol=1e-8),
+        odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
         sparse_jacobian=false,
         gradient_method=:ForwardDiff
     ), petab_model
@@ -477,6 +609,8 @@ Mimics the run structure in PEtabMultistartResult.
 struct MultistartRun
     fmin::Float64
     xmin::Vector{Float64}
+    chisq::Float64
+    sse::Float64
 end
 
 """
@@ -492,15 +626,32 @@ struct MultistartResult
 end
 
 """
-    build_multistart_result(results, param_names)
+    build_multistart_result(results, param_names, petab_problem)
 
 Construct a PEtabMultistartResult-compatible object from loaded JLD2 results.
+Computes additional metrics (SSE, ChiSq).
 """
-function build_multistart_result(results, param_names)
+function build_multistart_result(results, param_names, petab_problem)
     runs = MultistartRun[]
-    for r in results
+    println("Computing metrics for $(length(results)) runs...")
+    
+    for (i, r) in enumerate(results)
         xmin = haskey(r, "xmin_vec") ? r["xmin_vec"] : extract_vector(r["xmin"])
-        push!(runs, MultistartRun(Float64(r["fmin"]), Vector{Float64}(xmin)))
+        
+        # Compute metrics
+        metrics = compute_metrics(petab_problem, xmin)
+        
+        # Log progress
+        if i % 10 == 0
+            println("  Processed $i/$(length(results)) runs")
+        end
+        
+        push!(runs, MultistartRun(
+            Float64(r["fmin"]), 
+            Vector{Float64}(xmin),
+            metrics.chisq,
+            metrics.sse
+        ))
     end
     
     best_idx = argmin([r.fmin for r in runs])
@@ -644,6 +795,10 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
         return nothing
     end
     
+    # Load PEtab problem ONCE to get correct parameter names/order
+    petab_problem, _ = load_petab_problem()
+    correct_param_names = string.(petab_problem.xnames)
+    
     # Find best result
     best_idx = argmin([r["fmin"] for r in successful])
     best = successful[best_idx]
@@ -655,14 +810,8 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     println("  Task ID: $(best["task_id"])")
     println("  Cost (fmin): $(best["fmin"])")
     println("\nBest parameters:")
-    # Extract keys from ComponentVector (handles fixed parameters)
-    display_names = if best_xmin isa ComponentVector
-        collect(keys(best_xmin))
-    else
-        param_names[1:length(best_xmin)]
-    end
     
-    for (name, val) in zip(display_names, best_xmin)
+    for (name, val) in zip(correct_param_names, best_xmin)
         display_name = replace(string(name), "log10_" => "")
         @printf("  %-35s = %10.6f\n", display_name, val)
     end
@@ -680,14 +829,8 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     println("\n📊 Summary saved to: $summary_file")
     
     # Save best parameters
-    # Use keys from the xmin vector itself (handles fixed parameters correctly)
-    xmin_keys = if best_xmin isa ComponentVector
-        collect(keys(best_xmin))
-    else
-        param_names[1:length(best_xmin)]  # Fallback for plain vectors
-    end
     best_params_df = DataFrame(
-        parameter = xmin_keys,
+        parameter = correct_param_names,
         value = collect(best_xmin)
     )
     best_params_file = joinpath(@__DIR__, "best_parameters.csv")
@@ -703,30 +846,31 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     println("  Max fmin: $(maximum(valid_fmin))")
     
     # =========================================================================
-    # WATERFALL PLOT - Using visualization.jl's plot_waterfall
+    # WATERFALL PLOTS - NLLH, SSE, ChiSq
     # =========================================================================
     println("\n" * "="^60)
-    println("GENERATING WATERFALL PLOT")
+    println("GENERATING WATERFALL PLOTS")
     println("="^60)
     
     ms_result = nothing
     try
-        ms_result = build_multistart_result(successful, param_names)
-        plot_waterfall(ms_result)
-        println("✅ Waterfall plot saved to: $(PLOTS_DIR)/waterfall_plot.png")
+        # ms_result uses correct names via petab_problem inside build_multistart_result
+        ms_result = build_multistart_result(successful, correct_param_names, petab_problem)
+        
+        # Plot NLLH
+        plot_waterfall(ms_result, metric=:fmin, title="Waterfall Plot (NLLH)", ylabel="Negative Log-Likelihood")
+        
+        # Plot ChiSq
+        plot_waterfall(ms_result, metric=:chisq, title="Waterfall Plot (Chi-Squared)", ylabel="Chi-Squared")
+        
+        # Plot SSE
+        plot_waterfall(ms_result, metric=:sse, title="Waterfall Plot (SSE)", ylabel="Sum of Squared Errors")
+        
     catch e
-        println("⚠️  Could not generate waterfall plot via IL6 function: $e")
-        # Fallback waterfall
-        try
-            sorted_fmin = sort(valid_fmin)
-            p = bar(1:length(sorted_fmin), sorted_fmin .- minimum(sorted_fmin),
-                xlabel="Run (sorted)", ylabel="Δ Cost",
-                title="Waterfall Plot", legend=false,
-                size=(800, 500))
-            savefig(p, joinpath(PLOTS_DIR, "waterfall_plot.png"))
-            println("✅ Fallback waterfall plot saved")
-        catch e2
-            println("⚠️  Fallback waterfall also failed: $e2")
+        println("⚠️  Could not generate waterfall plots: $e")
+        for (exc, bt) in Base.catch_stack()
+            showerror(stdout, exc, bt)
+            println()
         end
     end
 
@@ -754,7 +898,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     # =========================================================================
     # IDENTIFIABILITY ANALYSIS - Using identifiability.jl
     # =========================================================================
-    if run_ident
+    if run_ident && HAS_IL6_TGFB
         println("\n" * "="^60)
         println("RUNNING IDENTIFIABILITY ANALYSIS (FIM)")
         println("="^60)
@@ -796,7 +940,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     try
         petab_problem, petab_model = load_petab_problem()
         θ_best = Vector{Float64}(best_xmin)
-        plot_model_fit(petab_problem, θ_best, param_names)
+        plot_model_fit(petab_problem, θ_best, correct_param_names)
         println("✅ Model fit plots complete")
     catch e
         println("⚠️  Model fit plotting failed: $e")
@@ -809,7 +953,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     # =========================================================================
     # LIKELIHOOD PROFILING - Using profiling_plot.jl (optional, slow)
     # =========================================================================
-    if run_profiles
+    if run_profiles && HAS_IL6_TGFB
         println("\n" * "="^60)
         println("RUNNING LIKELIHOOD PROFILING")
         println("="^60)
@@ -842,7 +986,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
         "task_id" => best["task_id"],
         "fmin" => best["fmin"],
         "xmin" => best_xmin,
-        "param_names" => param_names,
+        "param_names" => correct_param_names,
         "n_successful" => length(successful),
         "n_total" => length(results)
     ))

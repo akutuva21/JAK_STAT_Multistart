@@ -19,8 +19,10 @@ using SparseArrays
 using LineSearches
 using ForwardDiff
 
-# Polyfill for findnz on dense matrices (missing in Julia 1.10+ SparseArrays)
-# PEtab.jl or its dependencies seem to rely on this behavior
+# REQUIRED POLYFILL: findnz for dense matrices
+# PEtab.jl or ModelingToolkit calls findnz on dense Jacobians.
+# In Julia 1.10+, SparseArrays.findnz only works on sparse matrices.
+# This type piracy is necessary for compatibility - do not remove.
 function SparseArrays.findnz(A::AbstractMatrix)
     I = Int[]
     J = Int[]
@@ -83,6 +85,16 @@ end
 function load_petab_from_files()
     println("Loading PEtab problem from TSV files...")
     
+    # Verify required files exist
+    if !isfile(MODEL_NET)
+        error("Model file not found: $MODEL_NET")
+    end
+    for f in [MEASUREMENTS_FILE, CONDITIONS_FILE, PARAMETERS_FILE, OBSERVABLES_FILE]
+        if !isfile(f)
+            error("PEtab file not found: $f")
+        end
+    end
+    
     prn = loadrxnetwork(BNGNetwork(), MODEL_NET)
     rsys = complete(prn.rn)
     odesys = structural_simplify(convert(ODESystem, rsys); simplify=true)
@@ -131,15 +143,20 @@ function load_petab_from_files()
         end
     end
     
-    # Build observables
-    @parameters sf_pSTAT1 sigma_pSTAT1
+    # Build observables - MUST use dynamic scale factor construction for each observable
     observables = Dict{String, PEtabObservable}()
     for row in eachrow(observables_df)
         obs_id = row.observableId
-        obs_name = replace(row.observableFormula, r"sf_\w+ \* " => "")
+        formula = row.observableFormula
+        noise_formula = row.noiseFormula
+        
+        # 1. Resolve State/Observable from model (e.g., total_pS1)
+        m_obs = match(r"sf_\w+\s*\*\s*(\w+)", formula)
+        base_obs_name = isnothing(m_obs) ? formula : m_obs.captures[1]
+        
         model_obs_sym = nothing
         for obs_eq in observed(rsys)
-            if contains(string(obs_eq.lhs), obs_name)
+            if contains(string(obs_eq.lhs), base_obs_name)
                 model_obs_sym = obs_eq.rhs
                 break
             end
@@ -147,7 +164,31 @@ function load_petab_from_files()
         if isnothing(model_obs_sym)
             model_obs_sym = species(rsys)[1]
         end
-        observables[obs_id] = PEtabObservable(sf_pSTAT1 * model_obs_sym, Symbol(row.noiseFormula))
+        
+        # 2. Resolve Scale Factor (e.g., sf_pSTAT1, sf_pSTAT3) - use @parameters for each
+        m_sf = match(r"(sf_\w+)\s*\*", formula)
+        
+        # 3. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 4. Build observable expression with scale factor
+        if isnothing(m_sf)
+            obs_expr = model_obs_sym
+        else
+            # CRITICAL: Create a UNIQUE symbolic parameter for EACH observable's scale factor
+            sf_name = Symbol(m_sf.captures[1])
+            sf_param = only(@parameters $sf_name)
+            obs_expr = sf_param * model_obs_sym
+        end
+        
+        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
+        # The +0.01 prevents division by zero when prediction ≈ 0
+        # This matches the paper's 15% CV noise model
+        noise_expr = sigma_param * (obs_expr + 0.01)
+        
+        observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end
     
     # Prepare measurements
@@ -164,7 +205,7 @@ function load_petab_from_files()
     # sparse_jacobian=false to use Dense Jacobian (avoids Sparspak dependency for Duals)
     # gradient_method=:ForwardDiff to avoid Adjoint KeyErrors (proven to work)
     return PEtabODEProblem(petab_model; 
-        odesolver=ODESolver(QNDF(); abstol=1e-8, reltol=1e-8),
+        odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
         sparse_jacobian=false,
         gradient_method=:ForwardDiff
     )
@@ -206,6 +247,20 @@ function run_single_task(args)
     all_startguesses = [lb .+ rand(n_params) .* (ub .- lb) for _ in 1:n_starts]
     p0 = all_startguesses[task_id]
     
+    # Check for existing checkpoint and resume if available
+    chkpt_file = joinpath(RESULTS_DIR, "run_$(task_id)_chkpt.jld2")
+    if isfile(chkpt_file)
+        try
+            chkpt = JLD2.load(chkpt_file)
+            p0 = chkpt["xmin"]
+            prev_iter = get(chkpt, "iteration", 0)
+            prev_fmin = get(chkpt, "fmin", NaN)
+            println("  📁 Resuming from checkpoint: iter=$prev_iter, fmin=$prev_fmin")
+        catch e
+            println("  ⚠️ Failed to load checkpoint, starting fresh: $e")
+        end
+    end
+    
     # DIAGNOSTIC: Test cost function at nominal (middle of bounds) and sampled point
     nominal = (lb .+ ub) ./ 2
     println("\n--- DIAGNOSTIC ---")
@@ -240,7 +295,6 @@ function run_single_task(args)
     
     println("Starting optimization for task $task_id...")
     
-    println("Starting optimization for task $task_id...")
     
     # =========================================================================
     # OPTIMIZATION SETUP - Using Optimization.jl with LBFGS
@@ -301,17 +355,15 @@ function run_single_task(args)
             ub = petab_problem.upper_bounds
         )
         
-        println("  Using Optimization.jl w/ LBFGS (relaxed tolerances)...")
+        println("  Using Optimization.jl w/ Fminbox(LBFGS) for box-constrained optimization...")
         println("  Bounds: lb=$(minimum(lb)), ub=$(maximum(ub))")
         
-        # Solve with LBFGS - relaxed tolerances for faster convergence
+        # Solve with Fminbox(LBFGS) - LBFGS with proper box constraints
         # f_tol=1e-4: accept solution when function change is small
         # g_tol=1e-2: accept solution when gradient is small (very relaxed)
         # x_tol=1e-4: accept when parameters stop changing
-        # Note: We cap at 200 iters since convergence typically occurs by ~100
-        effective_maxiter = min(max_iter, 200)
-        sol = solve(opt_prob, Optim.LBFGS(); 
-            maxiters = effective_maxiter,
+        sol = solve(opt_prob, Optim.Fminbox(Optim.LBFGS()); 
+            maxiters = max_iter,
             maxtime = 3300.0,  # 55 minutes (5 min buffer for saving)
             callback = opt_callback,
             f_tol = 1e-4,

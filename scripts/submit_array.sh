@@ -6,7 +6,7 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=1
 #SBATCH --mem=10G
-#SBATCH --time=01:00:00
+#SBATCH --time=02:00:00
 #SBATCH --output=array_logs/fit_%a.out
 #SBATCH --error=array_logs/fit_%a.err
 #SBATCH --mail-type=ALL
@@ -25,7 +25,7 @@ mkdir -p "$SCRDIR"
 
 # --- 2. SETUP TRAP COMMAND ---
 # On exit, copy the single result file back.
-trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}.jld2 "$PROJECT_HOME"/results/' EXIT
+trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}*.jld2 "$PROJECT_HOME"/results/' EXIT
 
 # --- 3. PREPARE DIRECTORIES IN YOUR HOME FOLDER ---
 mkdir -p "$PROJECT_HOME"/array_logs
