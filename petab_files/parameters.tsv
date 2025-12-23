@@ -45,7 +45,5 @@ STAT3_SOCS3_ind	log10	1.0e-6	10000.0	1.0	1
 il6_il6r_unbinding	log10	1.0e-6	10000.0	1.0	1
 il6_jak2_med_STAT1_act	log10	1.0e-6	10000.0	1.0	1
 SOCS1_jak1_binding	log10	1.0e-6	10000.0	1.0	1
-sf_pSTAT1	log10	1.0e-7	1000.0	1.0	1
-sf_pSTAT3	log10	1.0e-7	1000.0	1.0	1
 sigma_pSTAT1	log10	0.01	1.0	0.15	0
 sigma_pSTAT3	log10	0.01	1.0	0.15	0

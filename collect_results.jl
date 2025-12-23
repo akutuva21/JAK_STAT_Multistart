@@ -185,87 +185,40 @@ end
     compute_metrics(petab_problem, theta_optim)
 
 Compute NLLH, ChiSq, and SSE for a parameter set.
+Uses PEtab v3.x API: prob.chi2(x), prob.residuals(x), prob.simulated_values(x)
 """
 function compute_metrics(petab_problem, theta_optim)
-    # Use PEtab's internal function to get residuals (if available) or compute manually
-    
-    # We can use the cost function to get NLLH
+    # NLLH using PEtab's built-in function
     nllh = try
         petab_problem.nllh(theta_optim)
-    catch
+    catch e
+        @warn "Failed to compute NLLH" exception=e
         NaN
     end
     
-    # To get SSE/ChiSq, we need individual residuals. 
-    ode_solutions = try
-         PEtab.solve_all_conditions(theta_optim, petab_problem, QNDF(); save_observed_t=true)
-    catch
-        nothing
+    # Chi-squared using PEtab v3.x API
+    chisq = try
+        petab_problem.chi2(theta_optim)
+    catch e
+        @warn "Failed to compute chi2" exception=e
+        NaN
     end
     
-    if isnothing(ode_solutions)
-        return (nllh=nllh, chisq=NaN, sse=NaN)
+    # SSE: computed from simulated_values vs measurements
+    sse = try
+        sim_vals = petab_problem.simulated_values(theta_optim)
+        # Get observed measurements - need to access the measurements DataFrame
+        measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
+        observed = Float64.(measurements_df.measurement)
+        
+        # SSE = sum of squared differences
+        sum((observed .- sim_vals).^2)
+    catch e
+        @warn "Failed to compute SSE" exception=e
+        NaN
     end
     
-    mi = petab_problem.model_info
-    df = mi.petab_measurements
-    
-    chisq = 0.0
-    sse = 0.0
-    
-    cache = getfield(petab_problem.probinfo, :cache)
-    
-    for (sol_id, sol) in ode_solutions
-        # Skip failed simulations
-        if sol.retcode != :Success && string(sol.retcode) != "Success"
-            continue
-        end
-        
-        # Find measurements for this condition
-        cond_mask = (String.(hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id) .== string(sol_id))
-        
-        # We need to iterate over each measurement for this condition
-        cond_indices = findall(cond_mask)
-        
-        for idx in cond_indices
-            t = df.time[idx]
-            obs_id = df.observable_id[idx]
-            meas_val = df.measurement[idx]
-            
-            # Map parameters for this specific observation point
-            maprow = mi.xindices.mapxobservable[idx]
-            
-            # Dynamic states
-            xdyn, xobs, xnoise, xnond = PEtab.split_x(theta_optim, mi.xindices)
-            
-            xobs_ps = PEtab.transform_x(xobs, mi.xindices, :xobservable, cache)
-            xnoise_ps = PEtab.transform_x(xnoise, mi.xindices, :xnoise, cache)
-            xnond_ps = PEtab.transform_x(xnond, mi.xindices, :xnondynamic, cache)
-            
-            # Evaluate model at time t
-            try
-                u_t = sol(t)
-                
-                # Compute observation h
-                h_val = PEtab._h(u_t, t, sol.prob.p, xobs_ps, xnond_ps, 
-                            mi.model.h, maprow, obs_id,
-                            mi.petab_parameters.nominal_value)
-                            
-                # Compute sigma
-                sigma_val = PEtab._sigma(u_t, t, sol.prob.p, xnoise_ps, xnond_ps, 
-                                    mi.model.sigma, maprow, obs_id,
-                                    mi.petab_parameters.nominal_value)
-                
-                # Accumulate
-                res = meas_val - h_val
-                sse += res^2
-                chisq += (res / sigma_val)^2
-                
-            catch e
-                 # Skip point if eval fails
-            end
-        end
-    end
+    println("  📊 compute_metrics: NLLH=$nllh, χ²=$chisq, SSE=$sse")
     
     return (nllh=nllh, chisq=chisq, sse=sse)
 end
@@ -296,10 +249,8 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
     # Create condition lookup for L1_0 and L2_0 values
     cond_lookup = Dict(string(row.conditionId) => row for row in eachrow(conditions))
     
-    # Extract sf_pSTAT1 from optimized parameters (scaling factor for observable)
-    sf_idx = findfirst(x -> contains(string(x), "sf_pSTAT1"), param_names)
-    sf_pSTAT1 = !isnothing(sf_idx) ? 10^theta_optim[sf_idx] : 1.0
-    println("  Using sf_pSTAT1 = $sf_pSTAT1")
+    # Paper doesn't use scale factors - model outputs are directly compared
+    println("  Note: Using raw model observables (no scale factors)")
     
     # Solve all conditions using PEtab infrastructure
     # Note: solve_all_conditions(x, prob, solver) requires 3 args!
@@ -560,27 +511,32 @@ function load_petab_problem()
             model_obs_sym = species(rsys)[1]
         end
         
-        # 2. Resolve Scale Factor - use @parameters for symbolic
+        # 2. Check for scale factor (optional - paper doesn't use scale factors)
         m_sf = match(r"(sf_\w+)\s*\*", formula)
         
-        # 3. Resolve Sigma Parameter - create symbolic parameter
-        m_sigma = match(r"(sigma_\w+)", noise_formula)
-        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
-        sigma_param = only(@parameters $sigma_name)
-        
-        # 4. Build observable expression
+        # 3. Build observable expression
         if isnothing(m_sf)
-            # No scale factor, use model observable directly
-            obs_expr = model_obs_sym
+            obs_expr = model_obs_sym  # Raw observable (paper uses this)
         else
-            # Create symbolic scale factor parameter
             sf_name = Symbol(m_sf.captures[1])
             sf_param = only(@parameters $sf_name)
             obs_expr = sf_param * model_obs_sym
         end
         
-        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
-        noise_expr = sigma_param * (obs_expr + 0.01)
+        # 4. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 5. Build noise expression
+        # Check if noise formula contains proportional term (prediction + offset)
+        if contains(noise_formula, "*") && contains(noise_formula, "+")
+            # Proportional noise: sigma * (prediction + 0.01)
+            noise_expr = sigma_param * (obs_expr + 0.01)
+        else
+            # Constant noise: just sigma (paper uses this)
+            noise_expr = sigma_param
+        end
         
         observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end

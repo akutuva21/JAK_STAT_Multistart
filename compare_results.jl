@@ -5,142 +5,536 @@ using CSV
 using DataFrames
 using Plots; gr()
 using Statistics
-using ModelingToolkit
-using DifferentialEquations
 using PEtab
+using ReactionNetworkImporters, Catalyst
+using DifferentialEquations, ModelingToolkit
+using OrdinaryDiffEq
 using Symbolics
-using ReactionNetworkImporters
-using Catalyst
-using StatsPlots
+using SymbolicUtils
 
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
 const RESULT_FILE = joinpath(@__DIR__, "best_parameters.csv")
-const PTEMPEST_DIR = joinpath(@__DIR__, "STAT_models", "pSTAT_mechanistic_model", "Data", "BNGL_pSTAT_simulations")
-const PARAM_SETS_FILE = joinpath(PTEMPEST_DIR, "param_sets.csv")
-const PTEMPEST_TRAJ_PSTAT1 = joinpath(PTEMPEST_DIR, "pSTAT1_trajs.csv")
-const PTEMPEST_TRAJ_PSTAT3 = joinpath(PTEMPEST_DIR, "pSTAT3_trajs.csv")
+const DATA_DIR = joinpath(@__DIR__, "Data")
+const PTEMPEST_TRAJ_PSTAT1 = joinpath(DATA_DIR, "pSTAT1_trajs.csv")
+const PTEMPEST_TRAJ_PSTAT3 = joinpath(DATA_DIR, "pSTAT3_trajs.csv")
+const PTEMPEST_PARAMS = joinpath(DATA_DIR, "param_sets.csv")
 const PLOT_DIR = joinpath(@__DIR__, "final_results_plots", "ptempest_comparison")
 
+# PEtab/Model files
 const MODEL_NET = joinpath(@__DIR__, "variable_JAK_STAT_SOCS_degrad_model.net")
+const PETAB_DIR = joinpath(@__DIR__, "petab_files")
+const MEASUREMENTS_FILE = joinpath(PETAB_DIR, "measurements.tsv")
+const CONDITIONS_FILE = joinpath(PETAB_DIR, "conditions.tsv")
+const PARAMETERS_FILE = joinpath(PETAB_DIR, "parameters.tsv")
+const OBSERVABLES_FILE = joinpath(PETAB_DIR, "observables.tsv")
+
+# Target condition for comparison (IL-6 10 ng/mL, IL-10 = 0)
+const TARGET_L1 = 10.0  # IL-6 concentration
+const TARGET_L2 = 0.0   # IL-10 concentration
 
 # ============================================================================
 # HELPER FUNCTIONS
 # ============================================================================
 
-function load_data()
-    println("Loading data...")
+function load_ptempest_trajectories()
+    println("Loading pTempest trajectories...")
+    
+    # Load parameter sets to identify conditions
+    if !isfile(PTEMPEST_PARAMS)
+        error("param_sets.csv not found at $PTEMPEST_PARAMS - needed to filter by condition")
+    end
+    
+    param_sets = CSV.read(PTEMPEST_PARAMS, DataFrame)
+    println("  Total trajectories in files: $(nrow(param_sets))")
+    
+    # Show condition breakdown
+    println("  Condition breakdown:")
+    conditions = combine(groupby(param_sets, [:L1_0, :L2_0]), nrow => :count)
+    for row in eachrow(conditions)
+        println("    L1=$(row.L1_0), L2=$(row.L2_0): $(row.count) trajectories")
+    end
+    
+    # Filter for target condition (IL-6 10 ng/mL, IL-10 = 0)
+    condition_mask = (param_sets.L1_0 .== TARGET_L1) .& (param_sets.L2_0 .== TARGET_L2)
+    n_filtered = sum(condition_mask)
+    println("  Filtering for L1=$(TARGET_L1), L2=$(TARGET_L2): $(n_filtered) trajectories")
+    
+    if n_filtered == 0
+        error("No trajectories found for target condition L1=$(TARGET_L1), L2=$(TARGET_L2)")
+    end
+    
+    # Load trajectory files (no header)
+    pstat1_all = CSV.read(PTEMPEST_TRAJ_PSTAT1, DataFrame; header=false)
+    pstat3_all = CSV.read(PTEMPEST_TRAJ_PSTAT3, DataFrame; header=false)
+    
+    # Apply condition filter
+    pstat1_filtered = pstat1_all[condition_mask, :]
+    pstat3_filtered = pstat3_all[condition_mask, :]
+    
+    # Time points: 0 to 90 minutes in 1-minute steps
+    n_timepoints = ncol(pstat1_filtered)
+    time_points = collect(0.0:(n_timepoints-1))
+    
+    println("  Loaded $(nrow(pstat1_filtered)) trajectories for IL-6 $(Int(TARGET_L1)) ng/mL condition")
+    println("  Time range: 0 to $(n_timepoints-1) minutes")
+    
+    return time_points, pstat1_filtered, pstat3_filtered, n_filtered
+end
+
+function load_best_parameters()
+    println("Loading best parameters...")
+    
     if !isfile(RESULT_FILE)
         error("Best parameters file not found: $RESULT_FILE")
     end
     
-    # Load our best parameters
     best_params_df = CSV.read(RESULT_FILE, DataFrame)
-    best_params = Dict(row.parameter => row.value for row in eachrow(best_params_df))
-    println("  Loaded best parameters: $(length(best_params))")
     
-    # Load pTempest data
-    ptempest_params = CSV.read(PARAM_SETS_FILE, DataFrame)
-    ptempest_pstat1 = CSV.read(PTEMPEST_TRAJ_PSTAT1, DataFrame)
-    ptempest_pstat3 = CSV.read(PTEMPEST_TRAJ_PSTAT3, DataFrame)
+    # Create dict: parameter name -> value (already in log10 scale)
+    best_params = Dict{String, Float64}()
+    for row in eachrow(best_params_df)
+        best_params[row.parameter] = row.value
+    end
     
-    println("  Loaded pTempest params: $(nrow(ptempest_params)) sets")
-    println("  Loaded pTempest pSTAT1 trajs: $(nrow(ptempest_pstat1))")
+    println("  Loaded $(length(best_params)) parameters")
     
-    return best_params, ptempest_params, ptempest_pstat1, ptempest_pstat3
+    return best_params, best_params_df
 end
 
-function overlay_trajectories(best_params, ptempest_pstat1, ptempest_pstat3)
-    println("Generating trajectory function overlay...")
+function load_petab_problem()
+    """
+    Load PEtab problem from .net file (same as collect_results.jl)
+    """
+    println("Loading PEtab problem from .net file...")
+    
+    prn = loadrxnetwork(BNGNetwork(), MODEL_NET)
+    rsys = complete(prn.rn)
+    odesys = structural_simplify(convert(ODESystem, rsys); simplify=true)
+    
+    measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
+    conditions_df = CSV.read(CONDITIONS_FILE, DataFrame; delim='\t')
+    parameters_df = CSV.read(PARAMETERS_FILE, DataFrame; delim='\t')
+    observables_df = CSV.read(OBSERVABLES_FILE, DataFrame; delim='\t')
+    
+    model_params = prn.p
+    param_map = Dict(string(Symbolics.getname(k)) => k for (k, v) in model_params)
+    
+    # Build simulation conditions
+    sim_conditions = Dict{String, Dict{Symbol, Float64}}()
+    for row in eachrow(conditions_df)
+        cond_id = string(row.conditionId)
+        cond_dict = Dict{Symbol, Float64}()
+        for col in names(conditions_df)
+            if col != "conditionId" && !ismissing(row[col])
+                if haskey(param_map, col)
+                    cond_dict[Symbolics.getname(param_map[col])] = Float64(row[col])
+                else
+                    cond_dict[Symbol(col)] = Float64(row[col])
+                end
+            end
+        end
+        sim_conditions[cond_id] = cond_dict
+    end
+    
+    # Build parameters
+    petab_params = PEtabParameter[]
+    for row in eachrow(parameters_df)
+        p_id = row.parameterId
+        p_scale = Symbol(row.parameterScale)
+        p_lb = Float64(row.lowerBound)
+        p_ub = Float64(row.upperBound)
+        p_nominal = Float64(row.nominalValue)
+        p_estimate = row.estimate == 1
+        
+        if haskey(param_map, p_id)
+            push!(petab_params, PEtabParameter(param_map[p_id]; 
+                value=p_nominal, estimate=p_estimate, scale=p_scale, lb=p_lb, ub=p_ub))
+        else
+            push!(petab_params, PEtabParameter(Symbol(p_id); 
+                value=p_nominal, estimate=p_estimate, scale=p_scale, lb=p_lb, ub=p_ub))
+        end
+    end
+    
+    # Build observables dictionary
+    observables = Dict{String, PEtabObservable}()
+    for row in eachrow(observables_df)
+        obs_id = row.observableId
+        formula = row.observableFormula
+        noise_formula = row.noiseFormula
+        
+        # Resolve State/Observable from model
+        m_obs = match(r"sf_\w+\s*\*\s*(\w+)", formula)
+        base_obs_name = isnothing(m_obs) ? formula : m_obs.captures[1]
+        
+        model_obs_sym = nothing
+        for obs_eq in observed(rsys)
+            if contains(string(obs_eq.lhs), base_obs_name)
+                model_obs_sym = obs_eq.rhs
+                break
+            end
+        end
+        if isnothing(model_obs_sym)
+            model_obs_sym = species(rsys)[1]
+        end
+        
+        # 2. Check for scale factor (optional - paper doesn't use scale factors)
+        m_sf = match(r"(sf_\w+)\s*\*", formula)
+        
+        # 3. Build observable expression
+        if isnothing(m_sf)
+            obs_expr = model_obs_sym  # Raw observable (paper uses this)
+        else
+            sf_name = Symbol(m_sf.captures[1])
+            sf_param = only(@parameters $sf_name)
+            obs_expr = sf_param * model_obs_sym
+        end
+        
+        # 4. Resolve Sigma Parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 5. Build noise expression
+        if contains(noise_formula, "*") && contains(noise_formula, "+")
+            noise_expr = sigma_param * (obs_expr + 0.01)
+        else
+            noise_expr = sigma_param  # Constant noise (paper uses this)
+        end
+        
+        observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
+    end
+    
+    # Prepare measurements
+    meas_df = copy(measurements_df)
+    if hasproperty(meas_df, :simulationConditionId)
+        rename!(meas_df, :simulationConditionId => :simulation_id)
+    end
+    
+    petab_model = PEtabModel(odesys, observables, meas_df, petab_params;
+        simulation_conditions=sim_conditions, verbose=false)
+    
+    return PEtabODEProblem(petab_model; 
+        odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
+        sparse_jacobian=false,
+        gradient_method=:ForwardDiff
+    )
+end
+
+function simulate_with_petab(best_params)
+    """
+    Use PEtab to simulate with best-fit parameters.
+    Returns trajectories for the IL6=10, IL10=0 condition.
+    """
+    println("Simulating with PEtab...")
+    
+    # Load PEtab problem from .net file
+    petab_prob = load_petab_problem()
+    
+    # Build parameter vector from best fit
+    param_names = string.(petab_prob.xnames)
+    x_best = zeros(length(param_names))
+    
+    for (i, name) in enumerate(param_names)
+        if haskey(best_params, name)
+            x_best[i] = best_params[name]
+        else
+            # Use nominal from PEtab if not in best fit
+            x_best[i] = petab_prob.xnominal[i]
+            println("  Warning: Using nominal for $name")
+        end
+    end
+    
+    println("  Parameter vector built: $(length(x_best)) parameters")
+    
+    # Get simulated values using PEtab's built-in function
+    # This returns values in measurement table order
+    sim_vals = petab_prob.simulated_values(x_best)
+    
+    # Load measurements to get time/condition info
+    measurements = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
+    
+    # Find the high IL6 condition (IL6=10, IL10=0)
+    conditions = CSV.read(CONDITIONS_FILE, DataFrame; delim='\t')
+    println("  Available conditions: ", conditions.conditionId)
+    
+    # Find condition with IL6=10, IL10=0 - look for cond_il6_10
+    high_il6_cond = nothing
+    for cid in conditions.conditionId
+        cid_str = string(cid)
+        # Match "cond_il6_10" but NOT "cond_il6_10_il10_X"
+        if cid_str == "cond_il6_10" || (occursin("il6_10", cid_str) && !occursin("il10", cid_str))
+            high_il6_cond = cid_str
+            break
+        end
+    end
+    
+    if isnothing(high_il6_cond)
+        # Fallback: just use first condition with high IL6
+        high_il6_cond = string(conditions.conditionId[1])
+        println("  Warning: Could not find IL6=10, IL10=0 condition, using $high_il6_cond")
+    end
+    
+    println("  Using condition: $high_il6_cond")
+    
+    # Extract trajectories for this condition
+    mask_pS1 = (measurements.simulationConditionId .== high_il6_cond) .& 
+               (measurements.observableId .== "obs_total_pS1")
+    mask_pS3 = (measurements.simulationConditionId .== high_il6_cond) .& 
+               (measurements.observableId .== "obs_total_pS3")
+    
+    times_pS1 = measurements.time[mask_pS1]
+    times_pS3 = measurements.time[mask_pS3]
+    
+    # Get indices into sim_vals
+    all_indices = 1:nrow(measurements)
+    idx_pS1 = all_indices[mask_pS1]
+    idx_pS3 = all_indices[mask_pS3]
+    
+    sim_pS1 = sim_vals[idx_pS1]
+    sim_pS3 = sim_vals[idx_pS3]
+    
+    # Paper doesn't use scale factors - simulated values are directly the model outputs
+    # which are normalized to IL-6 10ng/mL @ t=20
+    raw_pS1 = copy(sim_pS1)
+    raw_pS3 = copy(sim_pS3)
+    
+    println("  Simulated $(length(sim_pS1)) pSTAT1 points, $(length(sim_pS3)) pSTAT3 points")
+    println("  Note: Paper uses raw model outputs (no scale factors)")
+    println("  pSTAT1 range: $(minimum(raw_pS1)) - $(maximum(raw_pS1))")
+    println("  pSTAT3 range: $(minimum(raw_pS3)) - $(maximum(raw_pS3))")
+    
+    return times_pS1, raw_pS1, times_pS3, raw_pS3
+end
+
+function plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
+                                 times_pS1, best_pstat1, times_pS3, best_pstat3,
+                                 n_ptempest)
+    println("Generating trajectory overlay plots...")
     mkpath(PLOT_DIR)
     
-    # 1. Simulate our best fit
-    # We need to simulate for the condition corresponding to the pTempest simulation
-    # pTempest simulations are typically for a specific condition (e.g. high IL6)
-    # We'll assume standard high dose condition for now or check metadata if available
-    # For now, let's just plot the pTempest ensemble first to see dynamic range
+    # Compute stats for annotations
+    ptempest_matrix1 = Matrix(ptempest_pstat1)
+    ptempest_matrix3 = Matrix(ptempest_pstat3)
     
-    # Using time points from pTempest file
-    # Exclude the first column if it's an index or such, check column names
-    # Assuming columns are time points
+    ptempest_peaks1 = [maximum(ptempest_matrix1[i, :]) for i in 1:size(ptempest_matrix1, 1)]
+    ptempest_peaks3 = [maximum(ptempest_matrix3[i, :]) for i in 1:size(ptempest_matrix3, 1)]
     
-    time_points = parse.(Float64, names(ptempest_pstat1))
+    best_peak1 = maximum(best_pstat1)
+    best_peak3 = maximum(best_pstat3)
+    
+    pctl1 = 100 * mean(ptempest_peaks1 .<= best_peak1)
+    pctl3 = 100 * mean(ptempest_peaks3 .<= best_peak3)
     
     # --- pSTAT1 ---
-    p1 = plot(title="pSTAT1 Ensemble vs Best Fit", xlabel="Time (min)", ylabel="pSTAT1 (au)",legend=false)
+    p1 = plot(title="pSTAT1: pTempest vs Best Fit (IL-6 10 ng/mL, n=$n_ptempest)", 
+              xlabel="Time (min)", ylabel="pSTAT1 concentration (raw model units)",
+              legend=:topright, size=(800, 600), titlefontsize=11)
     
-    # Plot a subset of pTempest (e.g., first 500) to avoid memory issues
+    # Plot pTempest ensemble (subsample to avoid overplotting)
     n_plot = min(500, nrow(ptempest_pstat1))
-    println("  Plotting $n_plot background trajectories for pSTAT1...")
+    println("  Plotting $n_plot pTempest trajectories for pSTAT1...")
     
     for i in 1:n_plot
         vals = Float64.(collect(ptempest_pstat1[i, :]))
-        plot!(p1, time_points, vals, color=:gray, alpha=0.1, linewidth=1)
+        plot!(p1, time_points, vals, color=:gray, alpha=0.05, linewidth=0.5, label="")
     end
     
-    # We technically need to simulate our best fit here.
-    # To avoid full ODE setup in this script, we can load the cached best fit trajectory if saved,
-    # OR setup the ODE system quickly.
+    # Compute and plot pTempest median and quantiles
+    median_traj1 = vec(median(ptempest_matrix1, dims=1))
+    q05_traj1 = vec([quantile(ptempest_matrix1[:, j], 0.05) for j in 1:size(ptempest_matrix1, 2)])
+    q95_traj1 = vec([quantile(ptempest_matrix1[:, j], 0.95) for j in 1:size(ptempest_matrix1, 2)])
     
-    # For now, I'll focus on the parameter distribution plots which are easier.
-    # The trajectory simulation requires setting up the PEtab problem again.
+    plot!(p1, time_points, median_traj1, color=:blue, linewidth=2.5, 
+          label="pTempest Median ($(round(median(ptempest_peaks1), sigdigits=2)))")
+    plot!(p1, time_points, q05_traj1, color=:blue, linewidth=1.5, linestyle=:dash, 
+          label="pTempest 5-95%")
+    plot!(p1, time_points, q95_traj1, color=:blue, linewidth=1.5, linestyle=:dash, label="")
     
-    savefig(p1, joinpath(PLOT_DIR, "pSTAT1_overlay.png"))
+    # Plot best fit (scatter for discrete time points)
+    scatter!(p1, times_pS1, best_pstat1, color=:red, markersize=8, 
+             label="Best Fit ($(round(best_peak1, sigdigits=2)), $(round(pctl1, digits=0))th %ile)")
+    
+    # Add annotation box
+    annotate!(p1, [(0.98, 0.02, text("Best fit: $(round(pctl1, digits=1))th percentile", 
+                                     9, :right, :bottom, :darkgreen))])
+    
+    savefig(p1, joinpath(PLOT_DIR, "pSTAT1_trajectory_overlay.png"))
+    println("  > Saved: pSTAT1_trajectory_overlay.png")
     
     # --- pSTAT3 ---
-    p2 = plot(title="pSTAT3 Ensemble vs Best Fit", xlabel="Time (min)", ylabel="pSTAT3 (au)", legend=false)
-    println("  Plotting $n_plot background trajectories for pSTAT3...")
+    # Determine y-axis limit to show both pTempest and best fit
+    ymax_ptempest = maximum(ptempest_peaks3)
+    ymax_plot = max(ymax_ptempest * 1.1, best_peak3 * 1.1)
+    
+    p2 = plot(title="pSTAT3: pTempest vs Best Fit (IL-6 10 ng/mL, n=$n_ptempest)", 
+              xlabel="Time (min)", ylabel="pSTAT3 concentration (raw model units)",
+              legend=:topright, size=(800, 600), titlefontsize=11,
+              ylim=(0, ymax_plot))
+    
+    println("  Plotting $n_plot pTempest trajectories for pSTAT3...")
     
     for i in 1:n_plot
         vals = Float64.(collect(ptempest_pstat3[i, :]))
-        plot!(p2, time_points, vals, color=:gray, alpha=0.1, linewidth=1)
+        plot!(p2, time_points, vals, color=:gray, alpha=0.05, linewidth=0.5, label="")
     end
     
-    savefig(p2, joinpath(PLOT_DIR, "pSTAT3_overlay.png"))
+    # Compute and plot pTempest median and quantiles
+    median_traj3 = vec(median(ptempest_matrix3, dims=1))
+    q05_traj3 = vec([quantile(ptempest_matrix3[:, j], 0.05) for j in 1:size(ptempest_matrix3, 2)])
+    q95_traj3 = vec([quantile(ptempest_matrix3[:, j], 0.95) for j in 1:size(ptempest_matrix3, 2)])
+    
+    plot!(p2, time_points, median_traj3, color=:blue, linewidth=2.5, 
+          label="pTempest Median ($(round(median(ptempest_peaks3), sigdigits=2)))")
+    plot!(p2, time_points, q05_traj3, color=:blue, linewidth=1.5, linestyle=:dash, 
+          label="pTempest 5-95%")
+    plot!(p2, time_points, q95_traj3, color=:blue, linewidth=1.5, linestyle=:dash, label="")
+    
+    # Add horizontal line at pTempest max for reference
+    hline!(p2, [ymax_ptempest], color=:orange, linewidth=1.5, linestyle=:dot,
+           label="pTempest Max ($(round(ymax_ptempest, sigdigits=2)))")
+    
+    # Plot best fit
+    scatter!(p2, times_pS3, best_pstat3, color=:red, markersize=8, 
+             label="Best Fit ($(round(best_peak3, sigdigits=2)))")
+    
+    # Add annotation box
+    ratio_to_max = best_peak3 / ymax_ptempest
+    
+    # FIXED: Replaced 'x' symbol
+    annotate!(p2, [(0.98, 0.98, text("Best fit: $(round(ratio_to_max, digits=1))x pTempest max", 
+                                     9, :right, :top, :darkred))])
+    
+    savefig(p2, joinpath(PLOT_DIR, "pSTAT3_trajectory_overlay.png"))
+    println("  > Saved: pSTAT3_trajectory_overlay.png")
+    
+    # --- Combined summary plot ---
+    p_combined = plot(p1, p2, layout=(1, 2), size=(1600, 600),
+                      plot_title="pTempest Ensemble Comparison (Cheemalavagu et al. 2024) Condition: IL-6 10 ng/mL, IL-10 = 0")
+    savefig(p_combined, joinpath(PLOT_DIR, "trajectory_comparison_summary.png"))
+    println("  > Saved: trajectory_comparison_summary.png")
+    
+    return p1, p2
 end
 
-function compare_parameters(best_params, ptempest_params)
-    println("Generating parameter comparisons...")
-    mkpath(PLOT_DIR)
+function compute_comparison_stats(time_points, ptempest_pstat1, ptempest_pstat3,
+                                  times_pS1, best_pstat1, times_pS3, best_pstat3,
+                                  n_ptempest)
+    println("\n" * "="^70)
+    println("COMPARISON STATISTICS")
+    println("Condition: IL-6 $(Int(TARGET_L1)) ng/mL, IL-10 = $(Int(TARGET_L2))")
+    println("pTempest trajectories: $n_ptempest (from Cheemalavagu et al. 2024)")
+    println("="^70)
     
-    # Identify common parameters
-    # Our params might be log10_, pTempest might be linear or log
-    # Check pTempest column names
+    ptempest_matrix1 = Matrix(ptempest_pstat1)
+    ptempest_matrix3 = Matrix(ptempest_pstat3)
     
-    ptempest_names = names(ptempest_params)
+    # Peak time analysis
+    println("\n--- Peak Time Analysis ---")
     
-    # Iterate through our best parameters
-    for (param_name, val) in best_params
-        # Handle log10 prefix
-        clean_name = replace(param_name, "log10_" => "")
-        
-        # Look for match in pTempest
-        # Try exact match first
-        match_col = nothing
-        if clean_name in ptempest_names
-            match_col = clean_name
-        else
-            # Try case insensitive or other variations if needed
-        end
-        
-        if isnothing(match_col)
-            continue
-        end
-        
-        # Plot distribution
-        vals = ptempest_params[!, match_col]
-        
-        # Check if pTempest is log or linear. Usually linear.
-        # Our val is log10 (if coming from best_parameters.csv which has log10_ prefix)
-        
-        # Let's plot in log10 space for better visualization
-        log_vals = log10.(vals .+ 1e-10) # Avoid log(0)
-        
-        p = density(log_vals, label="pTempest Ensemble", fill=true, alpha=0.5, title="Parameter: $clean_name")
-        vline!(p, [val], color=:red, linewidth=3, label="Our Best Fit")
-        
-        savefig(p, joinpath(PLOT_DIR, "param_dist_$(clean_name).png"))
+    # pTempest peak times
+    ptempest_peak_times1 = [argmax(ptempest_matrix1[i, :]) - 1 for i in 1:size(ptempest_matrix1, 1)]
+    ptempest_peak_times3 = [argmax(ptempest_matrix3[i, :]) - 1 for i in 1:size(ptempest_matrix3, 1)]
+    
+    # Best fit peak time (from discrete points)
+    best_peak_idx1 = argmax(best_pstat1)
+    best_peak_idx3 = argmax(best_pstat3)
+    best_peak_time1 = times_pS1[best_peak_idx1]
+    best_peak_time3 = times_pS3[best_peak_idx3]
+    
+    println("pSTAT1 peak time:")
+    println("  pTempest: median=$(median(ptempest_peak_times1)) min, range=$(minimum(ptempest_peak_times1))-$(maximum(ptempest_peak_times1)) min")
+    println("  Best fit: $(best_peak_time1) min")
+    
+    println("pSTAT3 peak time:")
+    println("  pTempest: median=$(median(ptempest_peak_times3)) min, range=$(minimum(ptempest_peak_times3))-$(maximum(ptempest_peak_times3)) min")
+    println("  Best fit: $(best_peak_time3) min")
+    
+    # Peak amplitude analysis
+    println("\n--- Peak Amplitude Analysis ---")
+    
+    ptempest_peaks1 = [maximum(ptempest_matrix1[i, :]) for i in 1:size(ptempest_matrix1, 1)]
+    ptempest_peaks3 = [maximum(ptempest_matrix3[i, :]) for i in 1:size(ptempest_matrix3, 1)]
+    
+    best_peak1 = maximum(best_pstat1)
+    best_peak3 = maximum(best_pstat3)
+    
+    println("pSTAT1 peak amplitude:")
+    println("  pTempest: median=$(round(median(ptempest_peaks1), sigdigits=3))")
+    println("           5th-95th: $(round(quantile(ptempest_peaks1, 0.05), sigdigits=3)) - $(round(quantile(ptempest_peaks1, 0.95), sigdigits=3))")
+    println("           min-max:  $(round(minimum(ptempest_peaks1), sigdigits=3)) - $(round(maximum(ptempest_peaks1), sigdigits=3))")
+    println("  Best fit: $(round(best_peak1, sigdigits=3))")
+    
+    println("\npSTAT3 peak amplitude:")
+    println("  pTempest: median=$(round(median(ptempest_peaks3), sigdigits=3))")
+    println("           5th-95th: $(round(quantile(ptempest_peaks3, 0.05), sigdigits=3)) - $(round(quantile(ptempest_peaks3, 0.95), sigdigits=3))")
+    println("           min-max:  $(round(minimum(ptempest_peaks3), sigdigits=3)) - $(round(maximum(ptempest_peaks3), sigdigits=3))")
+    println("  Best fit: $(round(best_peak3, sigdigits=3))")
+    
+    # Where does best fit fall in pTempest distribution?
+    println("\n--- Percentile Ranking ---")
+    
+    pctl1 = 100 * mean(ptempest_peaks1 .<= best_peak1)
+    pctl3 = 100 * mean(ptempest_peaks3 .<= best_peak3)
+    
+    println("Best fit pSTAT1 peak is at $(round(pctl1, digits=1))th percentile of pTempest")
+    println("Best fit pSTAT3 peak is at $(round(pctl3, digits=1))th percentile of pTempest")
+    
+    # Ratio analysis
+    println("\n--- Ratio to pTempest Bounds ---")
+    
+    ratio_to_95th_1 = best_peak1 / quantile(ptempest_peaks1, 0.95)
+    ratio_to_max_1 = best_peak1 / maximum(ptempest_peaks1)
+    ratio_to_95th_3 = best_peak3 / quantile(ptempest_peaks3, 0.95)
+    ratio_to_max_3 = best_peak3 / maximum(ptempest_peaks3)
+    
+    println("pSTAT1:")
+    # FIXED: Replaced 'x' symbol
+    println("  Best fit / 95th percentile: $(round(ratio_to_95th_1, digits=2))x")
+    println("  Best fit / maximum:         $(round(ratio_to_max_1, digits=2))x")
+    if ratio_to_max_1 <= 1.0
+        println("  [OK] Within pTempest range")
+    else
+        println("  [NOTE] Above pTempest range")
+    end
+    
+    println("\npSTAT3:")
+    # FIXED: Replaced 'x' symbol
+    println("  Best fit / 95th percentile: $(round(ratio_to_95th_3, digits=2))x")
+    println("  Best fit / maximum:         $(round(ratio_to_max_3, digits=2))x")
+    if ratio_to_max_3 <= 1.0
+        println("  [OK] Within pTempest range")
+    else
+        println("  [NOTE] Above pTempest range by $(round((ratio_to_max_3-1)*100, digits=0))%")
+    end
+    
+    # pSTAT3/pSTAT1 ratio comparison
+    println("\n--- pSTAT3/pSTAT1 Ratio Analysis ---")
+    
+    ptempest_ratios = ptempest_peaks3 ./ ptempest_peaks1
+    best_ratio = best_peak3 / best_peak1
+    
+    println("pTempest pSTAT3/pSTAT1 ratio:")
+    println("  median: $(round(median(ptempest_ratios), digits=2))")
+    println("  5th-95th: $(round(quantile(ptempest_ratios, 0.05), digits=2)) - $(round(quantile(ptempest_ratios, 0.95), digits=2))")
+    println("Best fit pSTAT3/pSTAT1 ratio: $(round(best_ratio, digits=2))")
+    # FIXED: Replaced 'x' symbol
+    println("Ratio difference: $(round(best_ratio / median(ptempest_ratios), digits=1))x pTempest median")
+    
+    # Summary assessment
+    println("\n" * "="^70)
+    println("SUMMARY ASSESSMENT")
+    println("="^70)
+    # FIXED: Replaced emojis with text
+    println("pSTAT1: $(round(pctl1, digits=0))th percentile - ", 
+            pctl1 >= 5 && pctl1 <= 95 ? "[GOOD AGREEMENT]" : "[OUTSIDE TYPICAL RANGE]")
+    println("pSTAT3: $(round(pctl3, digits=0))th percentile - ",
+            pctl3 >= 5 && pctl3 <= 95 ? "[GOOD AGREEMENT]" : "[OUTSIDE TYPICAL RANGE]")
+    
+    if ratio_to_max_3 > 1.0
+        println("\nNote: pSTAT3 is $(round(ratio_to_max_3, digits=1))x the pTempest maximum.")
+        println("This may indicate different normalization or model configuration.")
     end
 end
 
@@ -148,9 +542,35 @@ end
 # MAIN
 # ============================================================================
 
+function main()
+    println("="^70)
+    println("pTEMPEST COMPARISON ANALYSIS")
+    println("Reference: Cheemalavagu et al. (2024) Cell Systems 15:37-48")
+    println("="^70)
+    
+    # Load data
+    time_points, ptempest_pstat1, ptempest_pstat3, n_ptempest = load_ptempest_trajectories()
+    best_params, best_params_df = load_best_parameters()
+    
+    # Simulate best fit using PEtab
+    times_pS1, best_pstat1, times_pS3, best_pstat3 = simulate_with_petab(best_params)
+    
+    # Generate plots
+    plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
+                           times_pS1, best_pstat1, times_pS3, best_pstat3,
+                           n_ptempest)
+    
+    # Compute stats
+    compute_comparison_stats(time_points, ptempest_pstat1, ptempest_pstat3,
+                            times_pS1, best_pstat1, times_pS3, best_pstat3,
+                            n_ptempest)
+    
+    println("\n" * "="^70)
+    println("COMPARISON COMPLETE")
+    println("Plots saved to: $PLOT_DIR")
+    println("="^70)
+end
+
 if abspath(PROGRAM_FILE) == @__FILE__
-    best_params, ptempest_params, pstat1, pstat3 = load_data()
-    # overlay_trajectories(best_params, pstat1, pstat3)
-    compare_parameters(best_params, ptempest_params)
-    println("Done!")
+    main()
 end

@@ -143,14 +143,15 @@ function load_petab_from_files()
         end
     end
     
-    # Build observables - MUST use dynamic scale factor construction for each observable
+    # Build observables - Paper uses raw model observables with constant sigma noise
     observables = Dict{String, PEtabObservable}()
     for row in eachrow(observables_df)
         obs_id = row.observableId
-        formula = row.observableFormula
-        noise_formula = row.noiseFormula
+        formula = row.observableFormula  # e.g., "total_pS1"
+        noise_formula = row.noiseFormula  # e.g., "sigma_pSTAT1"
         
         # 1. Resolve State/Observable from model (e.g., total_pS1)
+        # Handle both raw observables and scale factor formulas
         m_obs = match(r"sf_\w+\s*\*\s*(\w+)", formula)
         base_obs_name = isnothing(m_obs) ? formula : m_obs.captures[1]
         
@@ -165,28 +166,32 @@ function load_petab_from_files()
             model_obs_sym = species(rsys)[1]
         end
         
-        # 2. Resolve Scale Factor (e.g., sf_pSTAT1, sf_pSTAT3) - use @parameters for each
+        # 2. Check for scale factor (optional - paper doesn't use scale factors)
         m_sf = match(r"(sf_\w+)\s*\*", formula)
         
-        # 3. Resolve Sigma Parameter - create symbolic parameter
-        m_sigma = match(r"(sigma_\w+)", noise_formula)
-        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
-        sigma_param = only(@parameters $sigma_name)
-        
-        # 4. Build observable expression with scale factor
+        # 3. Build observable expression
         if isnothing(m_sf)
-            obs_expr = model_obs_sym
+            obs_expr = model_obs_sym  # Raw observable (paper uses this)
         else
-            # CRITICAL: Create a UNIQUE symbolic parameter for EACH observable's scale factor
             sf_name = Symbol(m_sf.captures[1])
             sf_param = only(@parameters $sf_name)
             obs_expr = sf_param * model_obs_sym
         end
         
-        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
-        # The +0.01 prevents division by zero when prediction ≈ 0
-        # This matches the paper's 15% CV noise model
-        noise_expr = sigma_param * (obs_expr + 0.01)
+        # 4. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 5. Build noise expression
+        # Check if noise formula contains proportional term (prediction + offset)
+        if contains(noise_formula, "*") && contains(noise_formula, "+")
+            # Proportional noise: sigma * (prediction + 0.01)
+            noise_expr = sigma_param * (obs_expr + 0.01)
+        else
+            # Constant noise: just sigma (paper uses this)
+            noise_expr = sigma_param
+        end
         
         observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end

@@ -119,26 +119,32 @@ function load_petab_from_files()
             error("Could not find observable '$base_obs_name' in model.")
         end
         
-        # 2. Resolve Scale Factor (e.g., sf_pSTAT1) - use @parameters for symbolic
+        # 2. Check for scale factor (optional - paper doesn't use scale factors)
         m_sf = match(r"(sf_\w+)\s*\*", formula)
         
-        # 3. Resolve Sigma Parameter - create symbolic parameter
-        m_sigma = match(r"(sigma_\w+)", noise_formula)
-        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
-        sigma_param = only(@parameters $sigma_name)
-        
-        # 4. Build observable expression with scale factor
+        # 3. Build observable expression
         if isnothing(m_sf)
-            obs_expr = model_obs_sym
+            obs_expr = model_obs_sym  # Raw observable (paper uses this)
         else
-            # Use @parameters macro to create proper symbolic variable
             sf_name = Symbol(m_sf.captures[1])
             sf_param = only(@parameters $sf_name)
             obs_expr = sf_param * model_obs_sym
         end
         
-        # 5. Build PROPORTIONAL NOISE expression: sigma * (scaled_prediction + 0.01)
-        noise_expr = sigma_param * (obs_expr + 0.01)
+        # 4. Resolve Sigma Parameter - create symbolic parameter
+        m_sigma = match(r"(sigma_\w+)", noise_formula)
+        sigma_name = isnothing(m_sigma) ? Symbol(noise_formula) : Symbol(m_sigma.captures[1])
+        sigma_param = only(@parameters $sigma_name)
+        
+        # 5. Build noise expression
+        # Check if noise formula contains proportional term (prediction + offset)
+        if contains(noise_formula, "*") && contains(noise_formula, "+")
+            # Proportional noise: sigma * (prediction + 0.01)
+            noise_expr = sigma_param * (obs_expr + 0.01)
+        else
+            # Constant noise: just sigma (paper uses this)
+            noise_expr = sigma_param
+        end
         
         observables[obs_id] = PEtabObservable(obs_expr, noise_expr)
     end

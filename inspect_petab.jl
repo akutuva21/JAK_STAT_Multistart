@@ -160,21 +160,51 @@ function export_petab_tables()
     avg_pS1 = load_and_average_stat(DATA_PSTAT1, "pSTAT1")
     avg_pS3 = load_and_average_stat(DATA_PSTAT3, "pSTAT3")
     
-    # 3. Find Normalization Factors Independently (il6_10 @ 20min)
+    # 3. Filter to 6 conditions shown in Fig 2B of the paper
+    # IL-6 only: 10 ng/ml, 1 ng/ml
+    # IL-10 only: 10 ng/ml, 1 ng/ml
+    # IL-6 + IL-10: 10+10 ng/ml, 1+1 ng/ml
+    fig2b_conditions = [
+        (10.0, 0.0),   # IL-6 = 10 ng/ml
+        (1.0, 0.0),    # IL-6 = 1 ng/ml
+        (0.0, 10.0),   # IL-10 = 10 ng/ml
+        (0.0, 1.0),    # IL-10 = 1 ng/ml
+        (10.0, 10.0),  # IL-6 + IL-10 = 10 ng/ml each
+        (1.0, 1.0),    # IL-6 + IL-10 = 1 ng/ml each
+    ]
+    
+    # Filter data to only keep Fig 2B conditions
+    function filter_to_fig2b(avg_data)
+        filtered = Dict{String, Dict{Float64, Float64}}()
+        for (cond, data) in avg_data
+            cond_tuple = parse_condition(cond)
+            if cond_tuple in fig2b_conditions
+                filtered[cond] = data
+            end
+        end
+        return filtered
+    end
+    
+    avg_pS1 = filter_to_fig2b(avg_pS1)
+    avg_pS3 = filter_to_fig2b(avg_pS3)
+    println("  Filtered to $(length(avg_pS1)) pSTAT1 conditions, $(length(avg_pS3)) pSTAT3 conditions")
+    
+    # 4. Normalize to IL-6 10 ng/mL at t=20 min (as per paper Figure 2B caption)
+    # "points represent independent experiments normalized to IL-6 10 ng/mL at 20 min"
     norm_pS1 = 1.0
     norm_pS3 = 1.0
     
     for (cond, data) in avg_pS1
         if parse_condition(cond) == (10.0, 0.0) && haskey(data, 20.0)
             norm_pS1 = data[20.0]
-            println("  pSTAT1 Norm Factor: $norm_pS1")
+            println("  pSTAT1 Norm Factor (IL6=10 @ t=20): $norm_pS1")
             break
         end
     end
     for (cond, data) in avg_pS3
         if parse_condition(cond) == (10.0, 0.0) && haskey(data, 20.0)
             norm_pS3 = data[20.0]
-            println("  pSTAT3 Norm Factor: $norm_pS3")
+            println("  pSTAT3 Norm Factor (IL6=10 @ t=20): $norm_pS3")
             break
         end
     end
@@ -223,12 +253,12 @@ function export_petab_tables()
     conditions_df = DataFrame(conditions_rows)
     
     # 6. Build Observables Table
-    # As per paper: 15% CV noise model
+    # Paper uses raw model observables WITHOUT scale factors
+    # Noise: constant sigma (15% CV)
     observables_df = DataFrame(
         observableId = ["obs_total_pS1", "obs_total_pS3"],
-        observableFormula = ["sf_pSTAT1 * total_pS1", "sf_pSTAT3 * total_pS3"],
-        noiseFormula = ["sigma_pSTAT1 * (sf_pSTAT1 * total_pS1 + 0.01)", 
-                        "sigma_pSTAT3 * (sf_pSTAT3 * total_pS3 + 0.01)"]
+        observableFormula = ["total_pS1", "total_pS3"],
+        noiseFormula = ["sigma_pSTAT1", "sigma_pSTAT3"]
     )
     
     # 7. Build Parameters Table
@@ -247,9 +277,8 @@ function export_petab_tables()
         ))
     end
     
-    # Add Scale Factors and Sigma (Fixed at 0.15 per paper)
-    push!(param_rows, (parameterId="sf_pSTAT1", parameterScale="log10", lowerBound=1e-7, upperBound=1e3, nominalValue=1.0, estimate=1))
-    push!(param_rows, (parameterId="sf_pSTAT3", parameterScale="log10", lowerBound=1e-7, upperBound=1e3, nominalValue=1.0, estimate=1))
+    # Add Sigma parameters (Fixed at 0.15 per paper's 15% CV)
+    # NO scale factors - paper doesn't use them
     push!(param_rows, (parameterId="sigma_pSTAT1", parameterScale="log10", lowerBound=1e-2, upperBound=1.0, nominalValue=0.15, estimate=0))
     push!(param_rows, (parameterId="sigma_pSTAT3", parameterScale="log10", lowerBound=1e-2, upperBound=1.0, nominalValue=0.15, estimate=0))
     
