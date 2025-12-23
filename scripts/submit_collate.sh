@@ -34,7 +34,8 @@ mkdir -p "$PROJECT_HOME"/final_results_plots
 mkdir -p "$PROJECT_HOME"/likelihood_profiles
 
 # --- 3. COPY ALL NECESSARY FILES TO SCRATCH ---
-cp "$PROJECT_HOME"/collect_results.jl "$SCRDIR"/
+mkdir -p "$SCRDIR"/src
+cp "$PROJECT_HOME"/src/collect_results.jl "$SCRDIR"/src/
 cp -r "$PROJECT_HOME"/results "$SCRDIR"/
 cp -r "$PROJECT_HOME"/petab_files "$SCRDIR"/
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
@@ -45,6 +46,6 @@ cd "$SCRDIR"
 # --- 5. RUN THE SCRIPT WITH --ident FLAG ---
 # Use IL6_TGFB project and sysimage for package availability
 julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" \
-    collect_results.jl --ident
+    src/collect_results.jl --ident
 
 echo "--- Collation & Analysis Finished ---"

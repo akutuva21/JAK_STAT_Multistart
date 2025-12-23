@@ -28,7 +28,8 @@ trap 'rsync -av "$SCRDIR"/identifiability_results.txt "$PROJECT_HOME"/ 2>/dev/nu
 mkdir -p "$PROJECT_HOME"/logs
 
 # --- 3. COPY FILES TO SCRATCH ---
-cp "$PROJECT_HOME"/structural_identifiability.jl "$SCRDIR"/
+mkdir -p "$SCRDIR"/src
+cp "$PROJECT_HOME"/src/structural_identifiability.jl "$SCRDIR"/src/
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
 cp -r "$PROJECT_HOME"/petab_files "$SCRDIR"/
 
@@ -39,6 +40,6 @@ cd "$SCRDIR"
 echo "Running structural_identifiability.jl..."
 # Note: Not using sysimage because StructuralIdentifiability isn't in it
 julia --project="$IL6_HOME/bngl_julia" \
-    structural_identifiability.jl
+    src/structural_identifiability.jl
 
 echo "--- Analysis Finished ---"

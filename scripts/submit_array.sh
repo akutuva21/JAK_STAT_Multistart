@@ -32,7 +32,8 @@ mkdir -p "$PROJECT_HOME"/array_logs
 mkdir -p "$PROJECT_HOME"/results
 
 # --- 4. COPY FILES TO SCRATCH ---
-cp "$PROJECT_HOME"/run_single_task.jl "$SCRDIR"/
+mkdir -p "$SCRDIR"/src
+cp "$PROJECT_HOME"/src/run_single_task.jl "$SCRDIR"/src/
 cp -r "$PROJECT_HOME"/petab_files "$SCRDIR"/
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
 
@@ -46,7 +47,7 @@ export JULIA_DEPOT_PATH="$SCRDIR/.julia:$HOME/.julia"
 
 # Use IL6_TGFB sysimage since it has the same packages
 
-julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" run_single_task.jl \
+julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" src/run_single_task.jl \
   --n-starts 100 \
   --task-id "$SLURM_ARRAY_TASK_ID" \
   --max-iter 1000

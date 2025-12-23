@@ -2,64 +2,26 @@
 
 This repository contains the codebase for running multistart parameter estimation and identifiability analysis for the JAK-STAT-SOCS degradation model.
 
-## System Overview
-
-The pipeline consists of three main stages, designed to run on a SLURM cluster:
-1.  **Optimization (Array Job)**: Runs hundreds of independent optimization fits in parallel.
-2.  **Collation**: Aggregates the results from all fits to find the best parameters.
-3.  **Identifiability**: Performs structural identifiability analysis on the model.
-
-## Configuration
-
-Before running any jobs, you must create a local configuration file to define your environment.
-
-1.  Create `user_config_slurm.sh` in the root directory (this file is ignored by git).
-2.  Add your email and path definitions:
-
-```bash
-#!/bin/bash
-export EMAIL="abc@email.com"
-export PROJECT_HOME="/path/to/project"
-export IL6_HOME="/path/to/IL6_TGFB"  # Path to dependencies/sysimage
-```
-
-## Execution
-
-Scripts are located in the `scripts/` directory. You can submit them using `sbatch` or the provided helper.
-
-### 1. Run Optimization Array
-This submits a job array (default 100 tasks) to fit the model from different starting points.
-
-```bash
-# Load config
-source user_config_slurm.sh
-
-# Submit
-sbatch --mail-user="$EMAIL" scripts/submit_array.sh
-```
-
-### 2. Collate Results
-After the array job finishes, run this to aggregate results and generate plots.
-
-```bash
-sbatch --mail-user="$EMAIL" scripts/submit_collate.sh
-```
-
-### 3. Identifiability Analysis
-Run this to perform structural identifiability analysis on the best fit.
-
-```bash
-sbatch --mail-user="$EMAIL" scripts/submit_identifiability.sh
-```
-
-**Resource Usage**: 1 CPU, 31GB Memory.
-
 ## Directory Structure
 
--   `scripts/`: SLURM submission scripts.
--   `run_single_task.jl`: Main Julia script for a single optimization run.
--   `collect_results.jl`: Script for aggregating results and plotting.
--   `structural_identifiability.jl`: Script for identifiability analysis.
--   `petab_files/`: PEtab configuration files (measurements, parameters, etc.).
--   `results/`: (Generated) individual fit results.
--   `final_results_plots/`: (Generated) summary plots and CSVs.
+| Directory | Description |
+| :--- | :--- |
+| `src/` | Julia source code (`collect_results.jl`, `run_multistart.jl`, etc.) |
+| `scripts/` | SLURM submission scripts (Bash) for cluster execution. |
+| `data/` | Input data (pTempest trajectories, parameters). |
+| `results/` | Output directory for optimization runs (local only). |
+| `petab_files/` | PEtab model definition. |
+| `STAT_models/` | BNGL/Net formats of the model. |
+
+## System Overview
+
+The pipeline consists of three main stages:
+1.  **Optimization**: Runs hundreds of independent fits in parallel (SLURM Array).
+2.  **Collation**: Aggregates results to find the global minimum.
+3.  **Identifiability**: Performs structural identifiability analysis using Hessian eigenvalues.
+
+## Configuration & Execution
+
+1.  **Setup**: Create `user_config_slurm.sh` with your paths (see `scripts/` for examples).
+2.  **Run**: Use `sbatch scripts/submit_array.sh` to start the optimization array.
+3.  **Analyze**: Run `julia src/collect_results.jl` to generate plots and reports.

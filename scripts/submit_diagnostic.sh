@@ -29,7 +29,8 @@ trap 'rsync -av "$SCRDIR"/diagnostic_output.txt "$PROJECT_HOME"/logs/ 2>/dev/nul
 mkdir -p "$PROJECT_HOME"/logs
 
 # --- 4. COPY FILES TO SCRATCH ---
-cp "$PROJECT_HOME"/diagnostic_model.jl "$SCRDIR"/
+mkdir -p "$SCRDIR"/src
+cp "$PROJECT_HOME"/src/diagnostic_model.jl "$SCRDIR"/src/
 cp -r "$PROJECT_HOME"/petab_files "$SCRDIR"/
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
 cp "$PROJECT_HOME"/best_parameters.csv "$SCRDIR"/ 2>/dev/null || echo "No best_parameters.csv found"
@@ -40,6 +41,6 @@ export OPENBLAS_NUM_THREADS=1
 export JULIA_DEPOT_PATH="$SCRDIR/.julia:$HOME/.julia"
 
 echo "Running diagnostic..."
-julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" diagnostic_model.jl 2>&1 | tee diagnostic_output.txt
+julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" src/diagnostic_model.jl 2>&1 | tee diagnostic_output.txt
 
 echo "--- DIAGNOSTIC COMPLETE ---"
