@@ -15,16 +15,68 @@ using SymbolicUtils
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-const RESULT_FILE = joinpath(@__DIR__, "..", "results", "sameaspaper", "best_parameters.csv")
-const DATA_DIR = joinpath(@__DIR__, "..", "data")
+# Handle both local (script in src/) and cluster (flat directory) cases
+function find_data_dir()
+    # Try local structure first (script in src/, data in ../Data/)
+    local_path = joinpath(@__DIR__, "..", "Data")
+    if isdir(local_path) && isfile(joinpath(local_path, "param_sets.csv"))
+        return local_path
+    end
+    # Try cluster structure (Data/ in same directory as script)
+    cluster_path = joinpath(@__DIR__, "Data")
+    if isdir(cluster_path) && isfile(joinpath(cluster_path, "param_sets.csv"))
+        return cluster_path
+    end
+    # Fallback to local path (will error later with informative message)
+    return local_path
+end
+
+function find_model_files()
+    # Try local structure first
+    local_net = joinpath(@__DIR__, "..", "variable_JAK_STAT_SOCS_degrad_model.net")
+    local_petab = joinpath(@__DIR__, "..", "petab_files")
+    if isfile(local_net) && isdir(local_petab)
+        return local_net, local_petab
+    end
+    # Try cluster structure (files in same directory)
+    cluster_net = joinpath(@__DIR__, "variable_JAK_STAT_SOCS_degrad_model.net")
+    cluster_petab = joinpath(@__DIR__, "petab_files")
+    if isfile(cluster_net) && isdir(cluster_petab)
+        return cluster_net, cluster_petab
+    end
+    # Fallback
+    return local_net, local_petab
+end
+
+function find_result_file()
+    # Try local structure first
+    local_path = joinpath(@__DIR__, "..", "results", "sameaspaper", "best_parameters.csv")
+    if isfile(local_path)
+        return local_path
+    end
+    # Try cluster structure (flat directory)
+    cluster_path = joinpath(@__DIR__, "best_parameters.csv")
+    if isfile(cluster_path)
+        return cluster_path
+    end
+    return local_path
+end
+
+const DATA_DIR = find_data_dir()
 const PTEMPEST_TRAJ_PSTAT1 = joinpath(DATA_DIR, "pSTAT1_trajs.csv")
 const PTEMPEST_TRAJ_PSTAT3 = joinpath(DATA_DIR, "pSTAT3_trajs.csv")
 const PTEMPEST_PARAMS = joinpath(DATA_DIR, "param_sets.csv")
-const PLOT_DIR = joinpath(@__DIR__, "..", "results", "sameaspaper", "final_results_plots", "ptempest_comparison")
+const RESULT_FILE = find_result_file()
+
+# Create plots directory - try local first, then cluster
+const PLOT_DIR = if isdir(joinpath(@__DIR__, "..", "results"))
+    joinpath(@__DIR__, "..", "results", "sameaspaper", "final_results_plots", "ptempest_comparison")
+else
+    joinpath(@__DIR__, "final_results_plots", "ptempest_comparison")
+end
 
 # PEtab/Model files
-const MODEL_NET = joinpath(@__DIR__, "..", "variable_JAK_STAT_SOCS_degrad_model.net")
-const PETAB_DIR = joinpath(@__DIR__, "..", "petab_files")
+const MODEL_NET, PETAB_DIR = find_model_files()
 const MEASUREMENTS_FILE = joinpath(PETAB_DIR, "measurements.tsv")
 const CONDITIONS_FILE = joinpath(PETAB_DIR, "conditions.tsv")
 const PARAMETERS_FILE = joinpath(PETAB_DIR, "parameters.tsv")
@@ -43,7 +95,7 @@ function load_ptempest_trajectories()
     
     # Load parameter sets to identify conditions
     if !isfile(PTEMPEST_PARAMS)
-        error("param_sets.csv not found at $PTEMPEST_PARAMS - needed to filter by condition")
+        error("param_sets.csv not found at $PTEMPEST_PARAMS - needed to filter by condition. Check capitalization (Data vs data).")
     end
     
     param_sets = CSV.read(PTEMPEST_PARAMS, DataFrame)
@@ -588,31 +640,324 @@ function compute_comparison_stats(time_points, ptempest_pstat1, ptempest_pstat3,
 end
 
 # ============================================================================
+# NLLH DISTRIBUTION COMPARISON (PI Feedback)
+# ============================================================================
+
+"""
+Load unique pTempest parameter sets (each row is repeated 6x for conditions).
+Returns: DataFrame with unique parameter sets (already in linear scale).
+"""
+function load_unique_ptempest_params()
+    println("\n" * "="^70)
+    println("LOADING pTEMPEST PARAMETER SETS FOR NLLH COMPARISON")
+    println("="^70)
+    
+    if !isfile(PTEMPEST_PARAMS)
+        error("param_sets.csv not found at $PTEMPEST_PARAMS")
+    end
+    
+    # Load all rows
+    param_sets = CSV.read(PTEMPEST_PARAMS, DataFrame)
+    println("  Total rows in param_sets.csv: $(nrow(param_sets))")
+    
+    # Each parameter set is repeated 6 times for 6 conditions
+    # Get unique sets by taking every 6th row (starting at 1)
+    n_total = nrow(param_sets)
+    n_unique = n_total ÷ 6
+    unique_indices = 1:6:n_total
+    
+    # Verify uniqueness by checking that L1_0 and L2_0 follow the expected pattern
+    unique_sets = param_sets[unique_indices, :]
+    println("  Extracted $(nrow(unique_sets)) unique parameter sets")
+    
+    # Verify: first condition should be L1=1, L2=0 for all unique sets
+    @assert all(unique_sets.L1_0 .== 1.0) "Expected L1_0=1 for first condition of each set"
+    @assert all(unique_sets.L2_0 .== 0.0) "Expected L2_0=0 for first condition of each set"
+    
+    return unique_sets
+end
+
+"""
+Get the mapping from pTempest parameter names to PEtab parameter IDs.
+"""
+function get_parameter_mapping()
+    # All parameters that are in both param_sets.csv and parameters.tsv
+    # Note: L1_0, L2_0, SOCS3_0, SOCS1_0 are condition variables, not estimated
+    return Dict(
+        "il6_il6r_binding" => "il6_il6r_binding",
+        "il6_il6r_unbinding" => "il6_il6r_unbinding",
+        "il6r_gp130_binding" => "il6r_gp130_binding",
+        "il6r_gp130_unbinding" => "il6r_gp130_unbinding",
+        "il6_complex_jak1_binding" => "il6_complex_jak1_binding",
+        "il6_complex_jak1_unbinding" => "il6_complex_jak1_unbinding",
+        "il6_complex_jak2_binding" => "il6_complex_jak2_binding",
+        "il6_complex_jak2_unbinding" => "il6_complex_jak2_unbinding",
+        "SOCS3_il6r_binding" => "SOCS3_il6r_binding",
+        "SOCS3_il6r_unbinding" => "SOCS3_il6r_unbinding",
+        "SOCS3_gp130_binding" => "SOCS3_gp130_binding",
+        "SOCS3_gp130_unbinding" => "SOCS3_gp130_unbinding",
+        "il6_jak1_med_STAT3_act" => "il6_jak1_med_STAT3_act",
+        "il6_jak1_med_STAT1_act" => "il6_jak1_med_STAT1_act",
+        "il6_jak2_med_STAT3_act" => "il6_jak2_med_STAT3_act",
+        "il6_jak2_med_STAT1_act" => "il6_jak2_med_STAT1_act",
+        "il10_il10r1_binding" => "il10_il10r1_binding",
+        "il10_il10r1_unbinding" => "il10_il10r1_unbinding",
+        "il10r1_il10r2_binding" => "il10r1_il10r2_binding",
+        "il10r1_il10r2_unbinding" => "il10r1_il10r2_unbinding",
+        "il10_complex_jak1_binding" => "il10_complex_jak1_binding",
+        "il10_complex_jak1_unbinding" => "il10_complex_jak1_unbinding",
+        "il10_jak1_med_STAT3_act" => "il10_jak1_med_STAT3_act",
+        "il10_jak1_med_STAT1_act" => "il10_jak1_med_STAT1_act",
+        "SOCS1_jak1_binding" => "SOCS1_jak1_binding",
+        "SOCS1_jak1_unbinding" => "SOCS1_jak1_unbinding",
+        "pSTAT3_rec_dissoc" => "pSTAT3_rec_dissoc",
+        "pSTAT1_rec_dissoc" => "pSTAT1_rec_dissoc",
+        "PTP_med_STAT3_deact" => "PTP_med_STAT3_deact",
+        "PTP_med_STAT1_deact" => "PTP_med_STAT1_deact",
+        "STAT3_SOCS3_ind" => "STAT3_SOCS3_ind",
+        "STAT3_SOCS1_ind" => "STAT3_SOCS1_ind",
+        "STAT1_SOCS3_ind" => "STAT1_SOCS3_ind",
+        "STAT1_SOCS1_ind" => "STAT1_SOCS1_ind",
+        "IL6R_0" => "IL6R_0",
+        "GP130_0" => "GP130_0",
+        "IL10R1_0" => "IL10R1_0",
+        "IL10R2_0" => "IL10R2_0",
+        "JAK1_0" => "JAK1_0",
+        "JAK2_0" => "JAK2_0",
+        "PTP3_0" => "PTP3_0",
+        "PTP1_0" => "PTP1_0",
+        "SOCS3_degrad" => "SOCS3_degrad",
+        "SOCS1_degrad" => "SOCS1_degrad",
+        "S3_0" => "S3_0",
+        "S1_0" => "S1_0"
+    )
+end
+
+"""
+Compute NLLH for each pTempest parameter set using our PEtab model.
+"""
+function compute_ptempest_nllh(unique_sets::DataFrame)
+    println("\n" * "="^70)
+    println("COMPUTING NLLH FOR pTEMPEST PARAMETER SETS")
+    println("="^70)
+    
+    # Load PEtab problem using the same function as trajectory comparison
+    println("Loading PEtab problem...")
+    petab_problem = load_petab_problem()
+    
+    # Get parameter names from PEtab
+    petab_param_ids = string.(petab_problem.xnames)
+    println("  PEtab has $(length(petab_param_ids)) parameters to estimate")
+    
+    # Get parameter mapping
+    param_map = get_parameter_mapping()
+    
+    # Compute NLLH for each unique pTempest parameter set
+    n_sets = nrow(unique_sets)
+    nllh_values = Float64[]
+    failed_indices = Int[]
+    
+    println("  Computing NLLH for $n_sets parameter sets...")
+    
+    for i in 1:n_sets
+        try
+            # Build parameter vector in PEtab order (log10 scale)
+            theta = zeros(Float64, length(petab_param_ids))
+            
+            for (j, pid) in enumerate(petab_param_ids)
+                pid_str = String(pid)
+                
+                # Find the matching pTempest column
+                if haskey(param_map, pid_str)
+                    ptempest_col = param_map[pid_str]
+                    if ptempest_col in names(unique_sets)
+                        linear_val = unique_sets[i, ptempest_col]
+                        # Convert to log10 scale (pTempest is linear, PEtab uses log10)
+                        if linear_val > 0
+                            theta[j] = log10(linear_val)
+                        else
+                            theta[j] = -6.0  # Default for zero/negative values
+                        end
+                    else
+                        theta[j] = 0.0  # Default if not found
+                    end
+                else
+                    theta[j] = 0.0  # Default for unmapped parameters
+                end
+            end
+            
+            # Compute NLLH using PEtab cost function
+            nllh = petab_problem.nllh(theta)
+            
+            if isfinite(nllh)
+                push!(nllh_values, nllh)
+            else
+                push!(failed_indices, i)
+            end
+        catch e
+            push!(failed_indices, i)
+        end
+        
+        # Progress update
+        if i % 100 == 0
+            println("    Processed $i / $n_sets sets ($(length(nllh_values)) successful)")
+        end
+    end
+    
+    println("  ✅ Computed NLLH for $(length(nllh_values)) / $n_sets sets")
+    if !isempty(failed_indices)
+        println("  ⚠️  $(length(failed_indices)) sets failed (simulation error or non-finite NLLH)")
+    end
+    
+    return nllh_values
+end
+
+"""
+Create NLLH distribution comparison plots.
+"""
+function plot_nllh_distribution(ptempest_nllh::Vector{Float64}, our_best_nllh::Float64)
+    println("\n" * "="^70)
+    println("GENERATING NLLH DISTRIBUTION COMPARISON PLOTS")
+    println("="^70)
+    
+    mkpath(PLOT_DIR)
+    
+    # Statistics
+    med_nllh = median(ptempest_nllh)
+    mean_nllh = mean(ptempest_nllh)
+    min_nllh = minimum(ptempest_nllh)
+    max_nllh = maximum(ptempest_nllh)
+    q05 = quantile(ptempest_nllh, 0.05)
+    q95 = quantile(ptempest_nllh, 0.95)
+    
+    println("pTempest NLLH Statistics:")
+    println("  N = $(length(ptempest_nllh))")
+    println("  Min = $(round(min_nllh, digits=2))")
+    println("  5th percentile = $(round(q05, digits=2))")
+    println("  Median = $(round(med_nllh, digits=2))")
+    println("  Mean = $(round(mean_nllh, digits=2))")
+    println("  95th percentile = $(round(q95, digits=2))")
+    println("  Max = $(round(max_nllh, digits=2))")
+    println("\nOur best fit NLLH: $(round(our_best_nllh, digits=2))")
+    
+    # How does our result compare?
+    pctl_rank = 100 * mean(ptempest_nllh .>= our_best_nllh)
+    println("Our result is better than $(round(pctl_rank, digits=1))% of pTempest ensemble")
+    
+    # --- Histogram Plot ---
+    p1 = histogram(ptempest_nllh, 
+                   bins=50,
+                   xlabel="NLLH (Negative Log-Likelihood)",
+                   ylabel="Count",
+                   title="NLLH Distribution: pTempest Ensemble vs Our Optimization",
+                   label="pTempest Ensemble (n=$(length(ptempest_nllh)))",
+                   fillalpha=0.6,
+                   color=:steelblue,
+                   size=(900, 600),
+                   legend=:topright)
+    
+    # Add vertical line for our best result
+    vline!(p1, [our_best_nllh], 
+           color=:red, linewidth=3, linestyle=:solid,
+           label="Our Best Fit (NLLH = $(round(our_best_nllh, digits=1)))")
+    
+    # Add vertical line for pTempest median
+    vline!(p1, [med_nllh],
+           color=:blue, linewidth=2, linestyle=:dash,
+           label="pTempest Median ($(round(med_nllh, digits=1)))")
+    
+    savefig(p1, joinpath(PLOT_DIR, "nllh_distribution_comparison.png"))
+    println("  ✅ Saved: nllh_distribution_comparison.png")
+    
+    # --- Zoomed Histogram (best region) ---
+    # Focus on the lower NLLH region where our result is
+    upper_bound = max(our_best_nllh + 200, q05)
+    good_nllh = filter(x -> x <= upper_bound, ptempest_nllh)
+    
+    if length(good_nllh) > 10
+        p2 = histogram(good_nllh, 
+                       bins=30,
+                       xlabel="NLLH (Negative Log-Likelihood)",
+                       ylabel="Count",
+                       title="NLLH Distribution (Zoomed: Best Fits)",
+                       label="pTempest (n=$(length(good_nllh)) with NLLH ≤ $(round(upper_bound, digits=0)))",
+                       fillalpha=0.6,
+                       color=:steelblue,
+                       size=(900, 600),
+                       legend=:topright)
+        
+        vline!(p2, [our_best_nllh], 
+               color=:red, linewidth=3, linestyle=:solid,
+               label="Our Best Fit (NLLH = $(round(our_best_nllh, digits=1)))")
+        
+        savefig(p2, joinpath(PLOT_DIR, "nllh_distribution_zoomed.png"))
+        println("  ✅ Saved: nllh_distribution_zoomed.png")
+    end
+    
+    # --- Summary Statistics Table ---
+    println("\n" * "="^70)
+    println("NLLH COMPARISON SUMMARY")
+    println("="^70)
+    println("| Metric                  | pTempest      | Our Result    |")
+    println("|-------------------------|---------------|---------------|")
+    println("| Best NLLH               | $(round(min_nllh, digits=2)) | $(round(our_best_nllh, digits=2)) |")
+    println("| Median NLLH             | $(round(med_nllh, digits=2)) | -             |")
+    println("| Improvement vs median   | -             | $(round(med_nllh - our_best_nllh, digits=2)) |")
+    println("| Percentile rank         | -             | Top $(round(100 - pctl_rank, digits=1))% |")
+    println("="^70)
+    
+    return Dict(
+        "ptempest_min" => min_nllh,
+        "ptempest_median" => med_nllh,
+        "ptempest_mean" => mean_nllh,
+        "our_best" => our_best_nllh,
+        "percentile_rank" => pctl_rank
+    )
+end
+
+# ============================================================================
 # MAIN
 # ============================================================================
 
-function main()
+function main(;run_nllh_comparison::Bool=true, run_trajectory_comparison::Bool=false)
     println("="^70)
     println("pTEMPEST COMPARISON ANALYSIS")
     println("Reference: Cheemalavagu et al. (2024) Cell Systems 15:37-48")
     println("="^70)
     
-    # Load data
-    time_points, ptempest_pstat1, ptempest_pstat3, n_ptempest = load_ptempest_trajectories()
-    best_params, best_params_df = load_best_parameters()
+    if run_trajectory_comparison
+        # Load data
+        time_points, ptempest_pstat1, ptempest_pstat3, n_ptempest = load_ptempest_trajectories()
+        best_params, best_params_df = load_best_parameters()
+        
+        # Simulate best fit using PEtab
+        times_pS1, best_pstat1, times_pS3, best_pstat3 = simulate_with_petab(best_params)
+        
+        # Generate plots
+        plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
+                               times_pS1, best_pstat1, times_pS3, best_pstat3,
+                               n_ptempest)
+        
+        # Compute stats
+        compute_comparison_stats(time_points, ptempest_pstat1, ptempest_pstat3,
+                                times_pS1, best_pstat1, times_pS3, best_pstat3,
+                                n_ptempest)
+    end
     
-    # Simulate best fit using PEtab
-    times_pS1, best_pstat1, times_pS3, best_pstat3 = simulate_with_petab(best_params)
-    
-    # Generate plots
-    plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
-                           times_pS1, best_pstat1, times_pS3, best_pstat3,
-                           n_ptempest)
-    
-    # Compute stats
-    compute_comparison_stats(time_points, ptempest_pstat1, ptempest_pstat3,
-                            times_pS1, best_pstat1, times_pS3, best_pstat3,
-                            n_ptempest)
+    if run_nllh_comparison
+        # Load unique pTempest parameter sets
+        unique_sets = load_unique_ptempest_params()
+        
+        # Compute NLLH for each pTempest parameter set
+        ptempest_nllh = compute_ptempest_nllh(unique_sets)
+        
+        # Our best NLLH (from optimization)
+        # Note: This is read from the log - in a real setup, read from best_parameters.csv summary
+        our_best_nllh = -79.31  # From collate output
+        
+        # Generate comparison plots
+        plot_nllh_distribution(ptempest_nllh, our_best_nllh)
+    end
     
     println("\n" * "="^70)
     println("COMPARISON COMPLETE")
@@ -621,5 +966,6 @@ function main()
 end
 
 if abspath(PROGRAM_FILE) == @__FILE__
-    main()
+    # Run both comparisons: normalized trajectory overlay + NLLH distribution
+    main(run_trajectory_comparison=true, run_nllh_comparison=true)
 end

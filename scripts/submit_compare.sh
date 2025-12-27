@@ -26,21 +26,24 @@ mkdir -p "$PROJECT_HOME"/logs
 mkdir -p "$PROJECT_HOME"/final_results_plots
 
 # --- 3. COPY FILES TO SCRATCH ---
-cp "$PROJECT_HOME"/compare_results.jl "$SCRDIR"/
+# Script (now in src/)
+cp "$PROJECT_HOME"/src/compare_results.jl "$SCRDIR"/
 
-# Best parameters from optimization
-cp "$PROJECT_HOME"/best_parameters.csv "$SCRDIR"/
+# Best parameters from optimization results
+cp "$PROJECT_HOME"/results/sameaspaper/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
+cp "$PROJECT_HOME"/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
+echo "Warning: best_parameters.csv not found"
 
-# Data directory with pTempest trajectories
+# Data directory with pTempest trajectories (uppercase Data/)
 mkdir -p "$SCRDIR"/Data
 cp "$PROJECT_HOME"/Data/pSTAT1_trajs.csv "$SCRDIR"/Data/
 cp "$PROJECT_HOME"/Data/pSTAT3_trajs.csv "$SCRDIR"/Data/
 cp "$PROJECT_HOME"/Data/param_sets.csv "$SCRDIR"/Data/
 
-# Model file for simulation
+# Model file for simulation (now in root)
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
 
-# PEtab files (needed for proper simulation)
+# PEtab files (now in root)
 mkdir -p "$SCRDIR"/petab_files
 cp "$PROJECT_HOME"/petab_files/*.tsv "$SCRDIR"/petab_files/
 

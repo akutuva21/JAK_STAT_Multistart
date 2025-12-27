@@ -12,9 +12,9 @@ using Printf
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
-const MODEL_NET = joinpath(@__DIR__, "variable_JAK_STAT_SOCS_degrad_model.net")
-const PETAB_DIR = joinpath(@__DIR__, "petab_files")
-const BEST_PARAMS_FILE = joinpath(@__DIR__, "best_parameters.csv")
+const MODEL_NET = joinpath(@__DIR__, "..", "variable_JAK_STAT_SOCS_degrad_model.net")
+const PETAB_DIR = joinpath(@__DIR__, "..", "petab_files")
+const BEST_PARAMS_FILE = joinpath(@__DIR__, "..", "best_parameters.csv")
 
 const MEASUREMENTS_FILE = joinpath(PETAB_DIR, "measurements.tsv")
 const CONDITIONS_FILE = joinpath(PETAB_DIR, "conditions.tsv")

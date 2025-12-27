@@ -24,12 +24,12 @@ SCRDIR="/scr/${SLURM_JOB_ID}"
 mkdir -p "$SCRDIR"
 
 # --- 2. SETUP TRAP COMMAND ---
-# On exit, copy the single result file back.
-trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}*.jld2 "$PROJECT_HOME"/results/' EXIT
+# On exit, copy the single result file back to the organized results folder.
+trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}*.jld2 "$PROJECT_HOME"/results/sameaspaper/' EXIT
 
 # --- 3. PREPARE DIRECTORIES IN YOUR HOME FOLDER ---
 mkdir -p "$PROJECT_HOME"/array_logs
-mkdir -p "$PROJECT_HOME"/results
+mkdir -p "$PROJECT_HOME"/results/sameaspaper
 
 # --- 4. COPY FILES TO SCRATCH ---
 mkdir -p "$SCRDIR"/src
