@@ -47,8 +47,8 @@ end
 # ============================================================================
 # CONSTANTS
 # ============================================================================
-const RESULTS_DIR = joinpath(@__DIR__, "..", "results", "sameaspaper")
-const PLOTS_DIR = joinpath(@__DIR__, "..", "results", "sameaspaper", "final_results_plots")
+const RESULTS_DIR = joinpath(@__DIR__, "..", "results")
+const PLOTS_DIR = joinpath(@__DIR__, "..", "final_results_plots")
 
 const MODEL_NET = joinpath(@__DIR__, "..", "variable_JAK_STAT_SOCS_degrad_model.net")
 const PETAB_DIR = joinpath(@__DIR__, "..", "petab_files")
@@ -847,7 +847,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     )
     sort!(summary_df, :fmin)
     
-    summary_file = joinpath(@__DIR__, "optimization_summary.csv")
+    summary_file = joinpath(@__DIR__, "..", "optimization_summary.csv")
     CSV.write(summary_file, summary_df)
     println("\n📊 Summary saved to: $summary_file")
     
@@ -856,7 +856,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
         parameter = correct_param_names,
         value = collect(best_xmin)
     )
-    best_params_file = joinpath(@__DIR__, "best_parameters.csv")
+    best_params_file = joinpath(@__DIR__, "..", "best_parameters.csv")
     CSV.write(best_params_file, best_params_df)
     println("💾 Best parameters saved to: $best_params_file")
     

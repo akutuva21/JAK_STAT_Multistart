@@ -30,7 +30,6 @@ mkdir -p "$PROJECT_HOME"/final_results_plots
 cp "$PROJECT_HOME"/src/compare_results.jl "$SCRDIR"/
 
 # Best parameters from optimization results
-cp "$PROJECT_HOME"/results/sameaspaper/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
 cp "$PROJECT_HOME"/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
 echo "Warning: best_parameters.csv not found"
 

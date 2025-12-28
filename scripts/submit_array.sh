@@ -24,12 +24,12 @@ SCRDIR="/scr/${SLURM_JOB_ID}"
 mkdir -p "$SCRDIR"
 
 # --- 2. SETUP TRAP COMMAND ---
-# On exit, copy the single result file back to the organized results folder.
-trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}*.jld2 "$PROJECT_HOME"/results/sameaspaper/' EXIT
+# On exit, copy the single result file back.
+trap 'rsync -av "$SCRDIR"/results/run_${SLURM_ARRAY_TASK_ID}*.jld2 "$PROJECT_HOME"/results/' EXIT
 
 # --- 3. PREPARE DIRECTORIES IN YOUR HOME FOLDER ---
 mkdir -p "$PROJECT_HOME"/array_logs
-mkdir -p "$PROJECT_HOME"/results/sameaspaper
+mkdir -p "$PROJECT_HOME"/results
 
 # --- 4. COPY FILES TO SCRATCH ---
 mkdir -p "$SCRDIR"/src
@@ -48,7 +48,7 @@ export JULIA_DEPOT_PATH="$SCRDIR/.julia:$HOME/.julia"
 # Use IL6_TGFB sysimage since it has the same packages
 
 julia --project="$IL6_HOME/bngl_julia" --sysimage="$IL6_HOME/SysImage/bngl_full.so" src/run_single_task.jl \
-  --n-starts 100 \
+  --n-starts "$SLURM_ARRAY_TASK_MAX" \
   --task-id "$SLURM_ARRAY_TASK_ID" \
   --max-iter 1000
 

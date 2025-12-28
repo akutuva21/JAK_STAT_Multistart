@@ -49,8 +49,8 @@ function find_model_files()
 end
 
 function find_result_file()
-    # Try local structure first
-    local_path = joinpath(@__DIR__, "..", "results", "sameaspaper", "best_parameters.csv")
+    # Try local structure first (project root)
+    local_path = joinpath(@__DIR__, "..", "best_parameters.csv")
     if isfile(local_path)
         return local_path
     end
@@ -68,12 +68,8 @@ const PTEMPEST_TRAJ_PSTAT3 = joinpath(DATA_DIR, "pSTAT3_trajs.csv")
 const PTEMPEST_PARAMS = joinpath(DATA_DIR, "param_sets.csv")
 const RESULT_FILE = find_result_file()
 
-# Create plots directory - try local first, then cluster
-const PLOT_DIR = if isdir(joinpath(@__DIR__, "..", "results"))
-    joinpath(@__DIR__, "..", "results", "sameaspaper", "final_results_plots", "ptempest_comparison")
-else
-    joinpath(@__DIR__, "final_results_plots", "ptempest_comparison")
-end
+# Create plots directory
+const PLOT_DIR = joinpath(@__DIR__, "..", "final_results_plots", "ptempest_comparison")
 
 # PEtab/Model files
 const MODEL_NET, PETAB_DIR = find_model_files()

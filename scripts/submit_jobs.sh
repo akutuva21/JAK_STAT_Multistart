@@ -12,8 +12,12 @@ echo "Submitting jobs for user: $EMAIL"
 
 # Usage examples (uncomment or run manually):
 # sbatch --mail-user="$EMAIL" submit_array.sh
-# sbatch --mail-user="$EMAIL" submit_identifiability.sh
 # sbatch --mail-user="$EMAIL" --dependency=afterok:<JOBID> submit_collate.sh
 
-echo "To submit the array job, run:"
-echo "sbatch --mail-user=\"$EMAIL\" submit_array.sh"
+# echo "To submit the array job, run:"
+# echo "sbatch --mail-user=\"$EMAIL\" submit_array.sh"
+
+sbatch --mail-user="$EMAIL" scripts/submit_array.sh
+sbatch --mail-user="$EMAIL" --dependency=afterok:<JOBID> scripts/submit_collate.sh
+
+

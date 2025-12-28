@@ -34,8 +34,7 @@ cp "$PROJECT_HOME"/src/diagnostic_model.jl "$SCRDIR"/src/
 cp -r "$PROJECT_HOME"/petab_files "$SCRDIR"/
 cp "$PROJECT_HOME"/variable_JAK_STAT_SOCS_degrad_model.net "$SCRDIR"/
 
-# Try to copy best_parameters.csv from results/sameaspaper/ first, then fallback
-cp "$PROJECT_HOME"/results/sameaspaper/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
+# Copy best_parameters.csv from project root
 cp "$PROJECT_HOME"/best_parameters.csv "$SCRDIR"/ 2>/dev/null || \
 echo "Warning: No best_parameters.csv found"
 
