@@ -34,35 +34,10 @@ function parse_condition(col_name)
 end
 
 """
-Simple manual linear interpolation to fill in gaps across timepoints.
-Matches the "SciPy interpolation" mentioned in the paper.
-"""
-function linear_interpolate(times::Vector{Float64}, vals::Vector{Float64}, target_t::Float64)
-    if isempty(times) return NaN end
-    # Check if target_t is exactly in times
-    idx = findfirst(==(target_t), times)
-    if !isnothing(idx) return vals[idx] end
-    
-    # Boundary checks
-    if target_t < minimum(times) || target_t > maximum(times) return NaN end
-    
-    # Find surrounding points
-    lower_idx = findlast(<(target_t), times)
-    upper_idx = findfirst(>(target_t), times)
-    
-    if isnothing(lower_idx) || isnothing(upper_idx) return NaN end
-    
-    t0, t1 = times[lower_idx], times[upper_idx]
-    v0, v1 = vals[lower_idx], vals[upper_idx]
-    
-    return v0 + (v1 - v0) * (target_t - t0) / (t1 - t0)
-end
-
-"""
 Load all sheets from an Excel file, shift each to start at 0 at t=0,
 interpolate and average across all experiments.
 """
-function load_and_average_stat(data_path::String, stat_name::String)
+function load_and_average_stat(data_path::String, stat_name::String, normalize_per_exp::Bool=false)
     println("Processing $stat_name from: $(basename(data_path))")
     
     xf = XLSX.readxlsx(data_path)
@@ -116,6 +91,36 @@ function load_and_average_stat(data_path::String, stat_name::String)
                 end
             end
         end
+        
+        # NORMALIZE PER EXPERIMENT Logic
+        if normalize_per_exp
+            # Find normalization factor: il6_10 at t=20.0 (approx)
+            # Column name usually "il6_10"
+            norm_factor = 1.0
+            found_norm = false
+            
+            # Check for column "il6_10" or similar
+            norm_col_candidate = "il6_10"
+            if haskey(exp_data, norm_col_candidate)
+                # Check for t=20.0
+                if haskey(exp_data[norm_col_candidate], 20.0)
+                   norm_factor = exp_data[norm_col_candidate][20.0]
+                   found_norm = true
+                end
+            end
+            
+            if found_norm && norm_factor > 0
+                println("    Normalizing $sheet_name by factor $norm_factor")
+                for (c, t_dict) in exp_data
+                    for (t, v) in t_dict
+                        t_dict[t] = v / norm_factor
+                    end
+                end
+            else
+                println("    WARNING: No normalization factor found for $sheet_name (il6_10 @ 20.0). Using 1.0.")
+            end
+        end
+
         data_by_exp[sheet_name] = exp_data
     end
     
@@ -132,8 +137,12 @@ function load_and_average_stat(data_path::String, stat_name::String)
             vals_at_t = Float64[]
             for (exp, cond_dict) in data_by_exp
                 if haskey(cond_dict, cond) && haskey(cond_dict[cond], t)
-                    # Only use actual measured values - NO interpolation
-                    push!(vals_at_t, cond_dict[cond][t])
+                    val = cond_dict[cond][t]
+                    push!(vals_at_t, val)
+                    # DEBUG: Print contributors for specific condition and time
+                    if cond == "il6_10_il10_10" && t == 30.0
+                        println("  DEBUG: $exp contributes to $cond at t=$t with val=$val")
+                    end
                 end
             end
             if !isempty(vals_at_t)
@@ -153,23 +162,15 @@ function export_petab_tables()
     rsys = complete(prn.rn)
     
     # 2. Load and Average Data Independently
-    avg_pS1 = load_and_average_stat(DATA_PSTAT1, "pSTAT1")
-    avg_pS3 = load_and_average_stat(DATA_PSTAT3, "pSTAT3")
+    # NOW: Normalizing PER EXPERIMENT inside load_and_average_stat to be correct
+    avg_pS1 = load_and_average_stat(DATA_PSTAT1, "pSTAT1", true)
+    avg_pS3 = load_and_average_stat(DATA_PSTAT3, "pSTAT3", true)
     
-    # 3. Filter to 6 conditions shown in Fig 2B of the paper
-    # IL-6 only: 10 ng/ml, 1 ng/ml
-    # IL-10 only: 10 ng/ml, 1 ng/ml
-    # IL-6 + IL-10: 10+10 ng/ml, 1+1 ng/ml
+    # 3. Filter to 6 conditions shown in Fig 2B
     fig2b_conditions = [
-        (10.0, 0.0),   # IL-6 = 10 ng/ml
-        (1.0, 0.0),    # IL-6 = 1 ng/ml
-        (0.0, 10.0),   # IL-10 = 10 ng/ml
-        (0.0, 1.0),    # IL-10 = 1 ng/ml
-        (10.0, 10.0),  # IL-6 + IL-10 = 10 ng/ml each
-        (1.0, 1.0),    # IL-6 + IL-10 = 1 ng/ml each
+        (10.0, 0.0), (1.0, 0.0), (0.0, 10.0), (0.0, 1.0), (10.0, 10.0), (1.0, 1.0)
     ]
     
-    # Filter data to only keep Fig 2B conditions
     function filter_to_fig2b(avg_data)
         filtered = Dict{String, Dict{Float64, Float64}}()
         for (cond, data) in avg_data
@@ -183,27 +184,6 @@ function export_petab_tables()
     
     avg_pS1 = filter_to_fig2b(avg_pS1)
     avg_pS3 = filter_to_fig2b(avg_pS3)
-    println("  Filtered to $(length(avg_pS1)) pSTAT1 conditions, $(length(avg_pS3)) pSTAT3 conditions")
-    
-    # 4. Normalize to IL-6 10 ng/mL at t=20 min (as per paper Figure 2B caption)
-    # "points represent independent experiments normalized to IL-6 10 ng/mL at 20 min"
-    norm_pS1 = 1.0
-    norm_pS3 = 1.0
-    
-    for (cond, data) in avg_pS1
-        if parse_condition(cond) == (10.0, 0.0) && haskey(data, 20.0)
-            norm_pS1 = data[20.0]
-            println("  pSTAT1 Norm Factor (IL6=10 @ t=20): $norm_pS1")
-            break
-        end
-    end
-    for (cond, data) in avg_pS3
-        if parse_condition(cond) == (10.0, 0.0) && haskey(data, 20.0)
-            norm_pS3 = data[20.0]
-            println("  pSTAT3 Norm Factor (IL6=10 @ t=20): $norm_pS3")
-            break
-        end
-    end
     
     # 4. Build Combined Measurements Table
     meas_rows = []
@@ -216,7 +196,7 @@ function export_petab_tables()
                 observableId = "obs_total_pS1",
                 simulationConditionId = cond_id,
                 time = t,
-                measurement = val / norm_pS1,
+                measurement = val, # Already normalized
                 noiseParameters = "sigma_pSTAT1"
             ))
         end
@@ -230,7 +210,7 @@ function export_petab_tables()
                 observableId = "obs_total_pS3",
                 simulationConditionId = cond_id,
                 time = t,
-                measurement = val / norm_pS3,
+                measurement = val, # Already normalized
                 noiseParameters = "sigma_pSTAT3"
             ))
         end
