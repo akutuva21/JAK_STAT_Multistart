@@ -183,18 +183,32 @@ function plot_waterfall(ms_result; metric=:fmin, title="Waterfall Plot", ylabel=
 end
 
 """
-    compute_metrics(petab_problem, theta_optim)
+    compute_metrics(petab_problem, theta_optim, petab_model, sim_conditions, measurements_df)
 
 Compute NLLH, ChiSq, and SSE for a parameter set.
-Uses PEtab v3.x API: prob.chi2(x), prob.residuals(x), prob.simulated_values(x)
+NLLH uses custom function with analytic scaling factors (matches Python exactly).
 """
-function compute_metrics(petab_problem, theta_optim)
-    # NLLH using PEtab's built-in function
-    nllh = try
-        petab_problem.nllh(theta_optim)
-    catch e
-        @warn "Failed to compute NLLH" exception=e
-        NaN
+function compute_metrics(petab_problem, theta_optim, petab_model=nothing, sim_conditions=nothing, measurements_df=nothing)
+    # NLLH using custom function with analytic scaling (matches Python)
+    nllh = if !isnothing(petab_model) && !isnothing(sim_conditions) && !isnothing(measurements_df)
+        try
+            compute_nllh_with_scaling(theta_optim, petab_problem, petab_model, sim_conditions, measurements_df)
+        catch e
+            @warn "Failed to compute custom NLLH, falling back to PEtab" exception=e
+            try
+                petab_problem.nllh(theta_optim)
+            catch
+                NaN
+            end
+        end
+    else
+        # Fallback to PEtab's built-in if extra args not provided
+        try
+            petab_problem.nllh(theta_optim)
+        catch e
+            @warn "Failed to compute NLLH" exception=e
+            NaN
+        end
     end
     
     # Chi-squared using PEtab v3.x API
@@ -208,9 +222,8 @@ function compute_metrics(petab_problem, theta_optim)
     # SSE: computed from simulated_values vs measurements
     sse = try
         sim_vals = petab_problem.simulated_values(theta_optim)
-        # Get observed measurements - need to access the measurements DataFrame
-        measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
-        observed = Float64.(measurements_df.measurement)
+        meas_df = isnothing(measurements_df) ? CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t') : measurements_df
+        observed = Float64.(meas_df.measurement)
         
         # SSE = sum of squared differences
         sum((observed .- sim_vals).^2)
@@ -621,7 +634,129 @@ function load_petab_problem()
         odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
         sparse_jacobian=false,
         gradient_method=:ForwardDiff
-    ), petab_model
+    ), petab_model, sim_conditions
+end
+
+# ============================================================================
+# CUSTOM NLLH WITH ANALYTIC SCALING FACTORS (matches Python exactly)
+# ============================================================================
+"""
+    compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
+
+Compute NLLH with scaling factors computed analytically from normalization condition.
+This matches Python's parameter_estimator.py exactly:
+1. Simulate normalization condition (IL6=10, IL10=0) 
+2. Compute sf = exp_value / model_value at t=20
+3. Compute NLLH with proportional noise: σ * (sf * prediction + 0.01)
+"""
+function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
+    # Get sigma values (fixed parameters, not estimated)
+    sigma_pSTAT1 = 0.15
+    sigma_pSTAT3 = 0.15
+    
+    # Solve all conditions
+    ode_solutions = try
+        PEtab.solve_all_conditions(theta, petab_problem, QNDF(); save_observed_t=true)
+    catch
+        return Inf  # Simulation failed
+    end
+    
+    # Find normalization condition (IL6=10, IL10=0)
+    norm_cond_id = nothing
+    for (cond_id, cond_dict) in sim_conditions
+        L1_val = get(cond_dict, :L1_0, 0.0)
+        L2_val = get(cond_dict, :L2_0, 0.0)
+        if L1_val == 10.0 && L2_val == 0.0
+            norm_cond_id = cond_id
+            break
+        end
+    end
+    
+    if isnothing(norm_cond_id)
+        @warn "Normalization condition (IL6=10, IL10=0) not found"
+        return Inf
+    end
+    
+    # Get model values at t=20 for normalization condition
+    norm_sol = ode_solutions[Symbol(norm_cond_id)]
+    if !(norm_sol.retcode == :Success || string(norm_sol.retcode) == "Success")
+        return Inf  # Simulation failed
+    end
+    
+    # Interpolate to get values at t=20
+    u_t20 = norm_sol(20.0)
+    
+    # Get model values - assume last two are observables total_pS1 and total_pS3
+    pS1_model_20 = u_t20[end-1]
+    pS3_model_20 = u_t20[end]
+    
+    # Get experimental values at t=20 from normalization condition
+    norm_meas = filter(row -> 
+        row.simulationConditionId == norm_cond_id && row.time == 20.0, 
+        measurements_df)
+    
+    pS1_exp_20 = filter(row -> row.observableId == "obs_total_pS1", norm_meas)
+    pS3_exp_20 = filter(row -> row.observableId == "obs_total_pS3", norm_meas)
+    
+    if isempty(pS1_exp_20) || isempty(pS3_exp_20)
+        @warn "Experimental values at normalization condition not found"
+        return Inf
+    end
+    
+    pS1_exp_val = Float64(first(pS1_exp_20).measurement)
+    pS3_exp_val = Float64(first(pS3_exp_20).measurement)
+    
+    # Compute scaling factors
+    if pS1_model_20 < 1e-12 || pS3_model_20 < 1e-12
+        return Inf  # Model values too small
+    end
+    
+    sf_pSTAT1 = pS1_exp_val / pS1_model_20
+    sf_pSTAT3 = pS3_exp_val / pS3_model_20
+    
+    # Now compute NLLH with scaling
+    nllh = 0.0
+    
+    for row in eachrow(measurements_df)
+        cond_id = row.simulationConditionId
+        obs_id = row.observableId
+        time = Float64(row.time)
+        measurement = Float64(row.measurement)
+        
+        # Get solution for this condition
+        sol = ode_solutions[Symbol(cond_id)]
+        if !(sol.retcode == :Success || string(sol.retcode) == "Success")
+            return Inf
+        end
+        
+        # Interpolate to measurement time
+        u_t = sol(time)
+        
+        # Get model observable value
+        if contains(obs_id, "pS1")
+            model_val = u_t[end-1]
+            sf = sf_pSTAT1
+            sigma = sigma_pSTAT1
+        else
+            model_val = u_t[end]
+            sf = sf_pSTAT3
+            sigma = sigma_pSTAT3
+        end
+        
+        # Apply scaling
+        prediction = sf * model_val
+        
+        # Proportional noise: sigma * (prediction + 0.01)
+        noise_std = sigma * (prediction + 0.01)
+        
+        # Gaussian NLLH: 0.5 * (residual/σ)² + log(σ) + 0.5*log(2π)
+        residual = measurement - prediction
+        nllh += 0.5 * (residual / noise_std)^2
+        nllh += log(noise_std)
+        nllh += 0.5 * log(2π)
+    end
+    
+    return nllh
 end
 
 """
@@ -649,20 +784,20 @@ struct MultistartResult
 end
 
 """
-    build_multistart_result(results, param_names, petab_problem)
+    build_multistart_result(results, param_names, petab_problem, petab_model, sim_conditions, measurements_df)
 
 Construct a PEtabMultistartResult-compatible object from loaded JLD2 results.
-Computes additional metrics (SSE, ChiSq).
+Computes additional metrics (SSE, ChiSq) using custom NLLH with analytic scaling.
 """
-function build_multistart_result(results, param_names, petab_problem)
+function build_multistart_result(results, param_names, petab_problem, petab_model=nothing, sim_conditions=nothing, measurements_df=nothing)
     runs = MultistartRun[]
     println("Computing metrics for $(length(results)) runs...")
     
     for (i, r) in enumerate(results)
         xmin = haskey(r, "xmin_vec") ? r["xmin_vec"] : extract_vector(r["xmin"])
         
-        # Compute metrics
-        metrics = compute_metrics(petab_problem, xmin)
+        # Compute metrics with custom NLLH (matches Python)
+        metrics = compute_metrics(petab_problem, xmin, petab_model, sim_conditions, measurements_df)
         
         # Log progress
         if i % 10 == 0
@@ -818,8 +953,9 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
         return nothing
     end
     
-    # Load PEtab problem ONCE to get correct parameter names/order
-    petab_problem, _ = load_petab_problem()
+    # Load PEtab problem ONCE to get correct parameter names/order and objects for custom NLLH
+    petab_problem, petab_model, sim_conditions = load_petab_problem()
+    measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
     correct_param_names = string.(petab_problem.xnames)
     
     # Find best result
@@ -878,7 +1014,8 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     ms_result = nothing
     try
         # ms_result uses correct names via petab_problem inside build_multistart_result
-        ms_result = build_multistart_result(successful, correct_param_names, petab_problem)
+        # Pass additional args for custom NLLH with analytic scaling factors
+        ms_result = build_multistart_result(successful, correct_param_names, petab_problem, petab_model, sim_conditions, measurements_df)
         
         # Plot NLLH
         plot_waterfall(ms_result, metric=:fmin, title="Waterfall Plot (NLLH)", ylabel="Negative Log-Likelihood")
@@ -905,8 +1042,7 @@ function collect_results(; run_ident::Bool=true, run_profiles::Bool=false)
     println("="^60)
     
     try
-        # Load PEtab problem for plot_parameter_distribution
-        petab_problem, _ = load_petab_problem()
+        # petab_problem already loaded above
         # ms_result was built in the previous section
         plot_parameter_distribution(ms_result, petab_problem)
         println("✅ Parameter distribution plot saved to: $(PLOTS_DIR)/parameter_distribution_plot.png")

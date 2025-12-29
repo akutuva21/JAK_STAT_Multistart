@@ -213,8 +213,168 @@ function load_petab_from_files()
         odesolver=ODESolver(QNDF(); abstol=1e-6, reltol=1e-6),
         sparse_jacobian=false,
         gradient_method=:ForwardDiff
-    )
+    ), petab_model, sim_conditions
 end
+
+# ============================================================================
+# CUSTOM NLLH WITH ANALYTIC SCALING FACTORS (matches Python exactly)
+# ============================================================================
+"""
+    compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
+
+Compute NLLH with scaling factors computed analytically from normalization condition.
+This matches Python's parameter_estimator.py exactly:
+1. Simulate normalization condition (IL6=10, IL10=0) 
+2. Compute sf = exp_value / model_value at t=20
+3. Compute NLLH with proportional noise: σ * (sf * prediction + 0.01)
+"""
+function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
+    # Get sigma values (fixed parameters, not estimated)
+    sigma_pSTAT1 = 0.15
+    sigma_pSTAT3 = 0.15
+    
+    # Solve all conditions
+    ode_solutions = try
+        PEtab.solve_all_conditions(theta, petab_problem, QNDF(); save_observed_t=true)
+    catch
+        return Inf  # Simulation failed
+    end
+    
+    # Find normalization condition (IL6=10, IL10=0)
+    norm_cond_id = nothing
+    for (cond_id, cond_dict) in sim_conditions
+        L1_val = get(cond_dict, :L1_0, 0.0)
+        L2_val = get(cond_dict, :L2_0, 0.0)
+        if L1_val == 10.0 && L2_val == 0.0
+            norm_cond_id = cond_id
+            break
+        end
+    end
+    
+    if isnothing(norm_cond_id)
+        @warn "Normalization condition (IL6=10, IL10=0) not found"
+        return Inf
+    end
+    
+    # Get model values at t=20 for normalization condition
+    norm_sol = ode_solutions[Symbol(norm_cond_id)]
+    if !(norm_sol.retcode == :Success || string(norm_sol.retcode) == "Success")
+        return Inf  # Simulation failed
+    end
+    
+    # Interpolate to get values at t=20
+    u_t20 = norm_sol(20.0)
+    
+    # Get observable indices - find total_pS1 and total_pS3 in the model
+    model_info = petab_problem.model_info
+    # The observables are typically stored in model_info
+    # Access state indices for total_pS1 and total_pS3
+    state_syms = Symbol.(string.(states(model_info.model.sys)))
+    
+    pS1_idx = findfirst(s -> contains(string(s), "total_pS1"), state_syms)
+    pS3_idx = findfirst(s -> contains(string(s), "total_pS3"), state_syms)
+    
+    # If not found as states, they might be observables - try simulated_values approach
+    pS1_model_20 = NaN
+    pS3_model_20 = NaN
+    
+    # Get simulated values at normalization condition
+    try
+        # Use observed species from model
+        obs_syms = Symbol.(string.(observed(model_info.model.sys)))
+        for (i, obs_sym) in enumerate(obs_syms)
+            obs_str = string(obs_sym)
+            if contains(obs_str, "total_pS1")
+                # Evaluate observable at t=20
+                pS1_model_20 = u_t20[i]
+            elseif contains(obs_str, "total_pS3")
+                pS3_model_20 = u_t20[i]
+            end
+        end
+    catch
+        # Fallback: assume states are directly accessible
+    end
+    
+    # If still NaN, try direct access
+    if isnan(pS1_model_20) || isnan(pS3_model_20)
+        # The observables should be in state vector as observed quantities
+        # Try getting from solution directly
+        pS1_model_20 = u_t20[end-1]  # Assuming total_pS1 is second-to-last
+        pS3_model_20 = u_t20[end]    # Assuming total_pS3 is last
+    end
+    
+    # Get experimental values at t=20 from normalization condition
+    norm_meas = filter(row -> 
+        row.simulationConditionId == norm_cond_id && row.time == 20.0, 
+        measurements_df)
+    
+    pS1_exp_20 = filter(row -> row.observableId == "obs_total_pS1", norm_meas)
+    pS3_exp_20 = filter(row -> row.observableId == "obs_total_pS3", norm_meas)
+    
+    if isempty(pS1_exp_20) || isempty(pS3_exp_20)
+        @warn "Experimental values at normalization condition not found"
+        return Inf
+    end
+    
+    pS1_exp_val = Float64(first(pS1_exp_20).measurement)
+    pS3_exp_val = Float64(first(pS3_exp_20).measurement)
+    
+    # Compute scaling factors
+    if pS1_model_20 < 1e-12 || pS3_model_20 < 1e-12
+        return Inf  # Model values too small
+    end
+    
+    sf_pSTAT1 = pS1_exp_val / pS1_model_20
+    sf_pSTAT3 = pS3_exp_val / pS3_model_20
+    
+    # Now compute NLLH with scaling
+    nllh = 0.0
+    n_datapoints = 0
+    
+    for row in eachrow(measurements_df)
+        cond_id = row.simulationConditionId
+        obs_id = row.observableId
+        time = Float64(row.time)
+        measurement = Float64(row.measurement)
+        
+        # Get solution for this condition
+        sol = ode_solutions[Symbol(cond_id)]
+        if !(sol.retcode == :Success || string(sol.retcode) == "Success")
+            return Inf
+        end
+        
+        # Interpolate to measurement time
+        u_t = sol(time)
+        
+        # Get model observable value (same logic as above for indices)
+        if contains(obs_id, "pS1")
+            model_val = u_t[end-1]  # total_pS1
+            sf = sf_pSTAT1
+            sigma = sigma_pSTAT1
+        else
+            model_val = u_t[end]    # total_pS3
+            sf = sf_pSTAT3
+            sigma = sigma_pSTAT3
+        end
+        
+        # Apply scaling
+        prediction = sf * model_val
+        
+        # Proportional noise: sigma * (prediction + 0.01)
+        noise_std = sigma * (prediction + 0.01)
+        
+        # Gaussian NLLH: 0.5 * (residual/σ)² + log(σ) + 0.5*log(2π)
+        residual = measurement - prediction
+        nllh += 0.5 * (residual / noise_std)^2
+        nllh += log(noise_std)
+        nllh += 0.5 * log(2π)
+        
+        n_datapoints += 1
+    end
+    
+    return nllh
+end
+
 
 # ============================================================================
 # SINGLE TASK OPTIMIZATION
@@ -235,10 +395,11 @@ function run_single_task(args)
     
     # Load parameters_df for param names
     parameters_df = CSV.read(PARAMETERS_FILE, DataFrame; delim='\t')
+    measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
     param_names = parameters_df.parameterId
     
-    # Load problem
-    petab_problem = load_petab_from_files()
+    # Load problem (returns tuple with additional objects for custom NLLH)
+    petab_problem, petab_model, sim_conditions = load_petab_from_files()
     
     lb = petab_problem.lower_bounds
     ub = petab_problem.upper_bounds
@@ -268,15 +429,17 @@ function run_single_task(args)
     
     # DIAGNOSTIC: Test cost function at nominal (middle of bounds) and sampled point
     nominal = (lb .+ ub) ./ 2
-    println("\n--- DIAGNOSTIC ---")
+    custom_nllh = x -> compute_nllh_with_scaling(x, petab_problem, petab_model, sim_conditions, measurements_df)
+    
+    println("\n--- DIAGNOSTIC (using custom NLLH with analytic scaling) ---")
     try
-        cost_nominal = petab_problem.nllh(nominal)
+        cost_nominal = custom_nllh(nominal)
         println("  Cost at nominal parameters: $cost_nominal")
     catch e
         println("  Cost at nominal FAILED: $e")
     end
     try
-        cost_p0 = petab_problem.nllh(p0)
+        cost_p0 = custom_nllh(p0)
         println("  Cost at sampled p0: $cost_p0")
     catch e
         println("  Cost at p0 FAILED: $e")
@@ -285,7 +448,7 @@ function run_single_task(args)
     
     # Check gradient at p0
     try
-        g = ForwardDiff.gradient(petab_problem.nllh, p0)
+        g = ForwardDiff.gradient(custom_nllh, p0)
         if any(isnan, g)
             println("  WARNING: Gradient at p0 contains NaNs! Optimization will likely fail.")
         else
@@ -347,11 +510,13 @@ function run_single_task(args)
     local result = nothing
 
     try
-        # Build OptimizationFunction with gradient from PEtab
-        # PEtab provides grad!(G, x) so we wrap it for Optimization.jl's (G, x, p) signature
+        # Build OptimizationFunction with CUSTOM NLLH that uses analytic scaling factors
+        # This matches Python's parameter_estimator.py exactly
+        custom_nllh = x -> compute_nllh_with_scaling(x, petab_problem, petab_model, sim_conditions, measurements_df)
+        
         opt_f = OptimizationFunction(
-            (x, p) -> petab_problem.nllh(x);
-            grad = (G, x, p) -> petab_problem.grad!(G, x)
+            (x, p) -> custom_nllh(x);
+            grad = (G, x, p) -> ForwardDiff.gradient!(G, custom_nllh, x)
         )
         
         # Build OptimizationProblem with box constraints
