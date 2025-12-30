@@ -189,27 +189,30 @@ Compute NLLH, ChiSq, and SSE for a parameter set.
 NLLH uses custom function with analytic scaling factors (matches Python exactly).
 """
 function compute_metrics(petab_problem, theta_optim, petab_model=nothing, sim_conditions=nothing, measurements_df=nothing)
-    # NLLH using custom function with analytic scaling (matches Python)
-    nllh = if !isnothing(petab_model) && !isnothing(sim_conditions) && !isnothing(measurements_df)
+    # NLLH and SSE using custom function with analytic scaling (matches Python)
+    nllh_res = if !isnothing(petab_model) && !isnothing(sim_conditions) && !isnothing(measurements_df)
         try
             compute_nllh_with_scaling(theta_optim, petab_problem, petab_model, sim_conditions, measurements_df)
         catch e
             @warn "Failed to compute custom NLLH, falling back to PEtab" exception=e
             try
-                petab_problem.nllh(theta_optim)
+                (petab_problem.nllh(theta_optim), NaN)
             catch
-                NaN
+                (NaN, NaN)
             end
         end
     else
         # Fallback to PEtab's built-in if extra args not provided
         try
-            petab_problem.nllh(theta_optim)
+            (petab_problem.nllh(theta_optim), NaN)
         catch e
             @warn "Failed to compute NLLH" exception=e
-            NaN
+            (NaN, NaN)
         end
     end
+    
+    nllh = nllh_res[1]
+    sse_custom = nllh_res[2]
     
     # Chi-squared using PEtab v3.x API
     chisq = try
@@ -219,17 +222,19 @@ function compute_metrics(petab_problem, theta_optim, petab_model=nothing, sim_co
         NaN
     end
     
-    # SSE: computed from simulated_values vs measurements
-    sse = try
-        sim_vals = petab_problem.simulated_values(theta_optim)
-        meas_df = isnothing(measurements_df) ? CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t') : measurements_df
-        observed = Float64.(meas_df.measurement)
-        
-        # SSE = sum of squared differences
-        sum((observed .- sim_vals).^2)
-    catch e
-        @warn "Failed to compute SSE" exception=e
-        NaN
+    # SSE: Use custom SSE if available (scaled), otherwise fallback (unscaled/raw)
+    sse = if !isnan(sse_custom)
+        sse_custom
+    else
+        try
+            sim_vals = petab_problem.simulated_values(theta_optim)
+            meas_df = isnothing(measurements_df) ? CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t') : measurements_df
+            observed = Float64.(meas_df.measurement)
+            sum((observed .- sim_vals).^2)
+        catch e
+            @warn "Failed to compute SSE" exception=e
+            NaN
+        end
     end
     
     println("  📊 compute_metrics: NLLH=$nllh, χ²=$chisq, SSE=$sse")
@@ -360,8 +365,7 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
     # Create condition lookup for L1_0 and L2_0 values
     cond_lookup = Dict(string(row.conditionId) => row for row in eachrow(conditions))
     
-    # Paper doesn't use scale factors - model outputs are directly compared
-    println("  Note: Using raw model observables (no scale factors)")
+    println("  Note: Using analytic scale factors (t=20 normalization)")
     
     # Solve all conditions using PEtab infrastructure
     # Note: solve_all_conditions(x, prob, solver) requires 3 args!
@@ -379,7 +383,6 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
         println("  ⚠️  PEtab.solve_all_conditions failed: $e")
         println("  Falling back to data-only plots...")
     end
-    
     for obs_id in observables
         println("  Processing observable: $obs_id")
         
@@ -399,7 +402,99 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
                    top_margin=5Plots.mm,
                    bottom_margin=10Plots.mm)
         
-        for (idx, cond_id) in enumerate(condition_ids)
+    # Calculate scaling factors first (analytic scaling)
+    sf_pSTAT1 = 1.0
+    sf_pSTAT3 = 1.0
+    
+    mi = petab_problem.model_info
+    df = mi.petab_measurements
+    obs_col_df = df.observable_id
+    cond_col_df = hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id
+    time_col_df = df.time
+    
+    # Pre-calculate transformed parameter vectors
+    xdyn, xobs, xnoise, xnond = PEtab.split_x(theta_optim, mi.xindices)
+    cache = getfield(petab_problem.probinfo, :cache)
+    xobs_ps = PEtab.transform_x(xobs, mi.xindices, :xobservable, cache)
+    xnond_ps = PEtab.transform_x(xnond, mi.xindices, :xnondynamic, cache)
+    
+    if has_predictions
+        # Find normalization condition (IL6=10, IL10=0)
+        norm_cond_id = nothing
+        for (cond_id, row) in cond_lookup
+            L1_val = hasproperty(row, :L1_0) ? Float64(row.L1_0) : 0.0
+            L2_val = hasproperty(row, :L2_0) ? Float64(row.L2_0) : 0.0
+            if abs(L1_val - 10.0) < 1e-6 && abs(L2_val - 0.0) < 1e-6
+                norm_cond_id = cond_id
+                break
+            end
+        end
+        
+        if !isnothing(norm_cond_id)
+            norm_sol = ode_solutions[Symbol(norm_cond_id)]
+            if (norm_sol.retcode == :Success || string(norm_sol.retcode) == "Success")
+                u_t20 = norm_sol(20.0)
+                
+                # --- Calculate pSTAT1 scaling factor ---
+                norm_meas_pS1 = filter(row -> row.simulationConditionId == norm_cond_id && row.time == 20.0 && row.observableId == "obs_total_pS1", measurements)
+                
+                if !isempty(norm_meas_pS1)
+                     # Find matching row index in petab_measurements for using _h
+                     # (PEtab measurements dataframe row matching our condition/obs/time)
+                     obs_col = df.observable_id
+                     cond_col = hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id
+                     time_col = df.time
+                     
+                     mask = (String.(obs_col) .== "obs_total_pS1") .& 
+                            (String.(cond_col) .== String(norm_cond_id)) .& 
+                            (abs.(Float64.(time_col) .- 20.0) .< 0.01)
+                     r = findfirst(mask)
+                     
+                     if !isnothing(r)
+                         maprow = mi.xindices.mapxobservable[r]
+                         pS1_model_20 = PEtab._h(u_t20, 20.0, norm_sol.prob.p, xobs_ps, xnond_ps, 
+                                                mi.model.h, maprow, obs_col[r], 
+                                                mi.petab_parameters.nominal_value)
+                         
+                         pS1_exp_val = Float64(first(norm_meas_pS1).measurement)
+                         if abs(pS1_model_20) > 1e-12
+                             sf_pSTAT1 = pS1_exp_val / pS1_model_20
+                         end
+                     end
+                end
+                
+                # --- Calculate pSTAT3 scaling factor ---
+                norm_meas_pS3 = filter(row -> row.simulationConditionId == norm_cond_id && row.time == 20.0 && row.observableId == "obs_total_pS3", measurements)
+                
+                if !isempty(norm_meas_pS3)
+                     obs_col = df.observable_id
+                     cond_col = hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id
+                     time_col = df.time
+                     
+                     mask = (String.(obs_col) .== "obs_total_pS3") .& 
+                            (String.(cond_col) .== String(norm_cond_id)) .& 
+                            (abs.(Float64.(time_col) .- 20.0) .< 0.01)
+                     r = findfirst(mask)
+                     
+                     if !isnothing(r)
+                         maprow = mi.xindices.mapxobservable[r]
+                         pS3_model_20 = PEtab._h(u_t20, 20.0, norm_sol.prob.p, xobs_ps, xnond_ps, 
+                                                mi.model.h, maprow, obs_col[r], 
+                                                mi.petab_parameters.nominal_value)
+                         
+                         pS3_exp_val = Float64(first(norm_meas_pS3).measurement)
+                         if abs(pS3_model_20) > 1e-12
+                             sf_pSTAT3 = pS3_exp_val / pS3_model_20
+                         end
+                     end
+                end
+                
+                println("  Calculated analytic scale factors: pSTAT1=$(sf_pSTAT1), pSTAT3=$(sf_pSTAT3)")
+            end
+        end
+    end
+    
+    for (idx, cond_id) in enumerate(condition_ids)
             cond_meas = filter(row -> row.simulationConditionId == cond_id, obs_meas)
             
             if isempty(cond_meas)
@@ -426,38 +521,25 @@ function plot_model_fit(petab_problem, theta_optim, param_names)
                     sol_success = (sol.retcode == :Success) || 
                                   (string(sol.retcode) == "Success")
                     if sol_success
-                        mi = petab_problem.model_info
-                        df = mi.petab_measurements
-                        
                         for t in times
-                            try
-                                u_t = sol(t)
-                                
-                                # Find matching row in petab_measurements
-                                obs_col = df.observable_id
-                                cond_col = hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id
-                                time_col = df.time
-                                
-                                mask = (String.(obs_col) .== String(obs_id)) .& 
-                                       (String.(cond_col) .== String(cond_id)) .& 
-                                       (abs.(Float64.(time_col) .- t) .< 0.01)
-                                r = findfirst(mask)
-                                
-                                if !isnothing(r)
-                                    xdyn, xobs, xnoise, xnond = PEtab.split_x(theta_optim, mi.xindices)
-                                    cache = getfield(petab_problem.probinfo, :cache)
-                                    xobs_ps = PEtab.transform_x(xobs, mi.xindices, :xobservable, cache)
-                                    xnond_ps = PEtab.transform_x(xnond, mi.xindices, :xnondynamic, cache)
-                                    
-                                    maprow = mi.xindices.mapxobservable[r]
-                                    h = PEtab._h(u_t, t, sol.prob.p, xobs_ps, xnond_ps, 
-                                                mi.model.h, maprow, obs_col[r], 
-                                                mi.petab_parameters.nominal_value)
-                                    push!(pred_values, h)
-                                end
-                            catch
-                                # Skip this time point
+                            u_t = sol(t)
+
+                            # Evaluate observable via PEtab mapping (consistent with optimized NLLH)
+                            mask = (String.(obs_col_df) .== String(obs_id)) .&
+                                   (String.(cond_col_df) .== String(cond_id)) .&
+                                   (abs.(Float64.(time_col_df) .- t) .< 0.01)
+                            r = findfirst(mask)
+                            if isnothing(r)
+                                push!(pred_values, NaN)
+                                continue
                             end
+                            maprow = mi.xindices.mapxobservable[r]
+                            model_val = PEtab._h(u_t, t, sol.prob.p, xobs_ps, xnond_ps,
+                                                 mi.model.h, maprow, obs_col_df[r],
+                                                 mi.petab_parameters.nominal_value)
+
+                            sf = contains(obs_id, "pS1") ? sf_pSTAT1 : sf_pSTAT3
+                            push!(pred_values, Float64(sf * model_val))
                         end
                     end
                 end
@@ -656,9 +738,9 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
     
     # Solve all conditions
     ode_solutions = try
-        PEtab.solve_all_conditions(theta, petab_problem, QNDF(); save_observed_t=true)
+            PEtab.solve_all_conditions(theta, petab_problem, QNDF(); save_observed_t=true)
     catch
-        return Inf  # Simulation failed
+            return (Inf, NaN)  # Simulation failed
     end
     
     # Find normalization condition (IL6=10, IL10=0)
@@ -674,7 +756,7 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
     
     if isnothing(norm_cond_id)
         @warn "Normalization condition (IL6=10, IL10=0) not found"
-        return Inf
+        return (Inf, NaN)
     end
     
     # Get model values at t=20 for normalization condition
@@ -686,9 +768,57 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
     # Interpolate to get values at t=20
     u_t20 = norm_sol(20.0)
     
-    # Get model values - assume last two are observables total_pS1 and total_pS3
-    pS1_model_20 = u_t20[end-1]
-    pS3_model_20 = u_t20[end]
+    # Get model values using PEtab._h to ensure correct observable mapping
+    mi = petab_problem.model_info
+    df = mi.petab_measurements
+    
+    # Pre-calculate transformed parameter vectors
+    # Note: theta is the optimization vector here
+    xdyn, xobs, xnoise, xnond = PEtab.split_x(theta, mi.xindices)
+    cache = getfield(petab_problem.probinfo, :cache)
+    xobs_ps = PEtab.transform_x(xobs, mi.xindices, :xobservable, cache)
+    xnond_ps = PEtab.transform_x(xnond, mi.xindices, :xnondynamic, cache)
+
+    pS1_model_20 = 0.0
+    pS3_model_20 = 0.0
+    
+    # Find list indices for pS1 and pS3 at t=20 in normalization condition
+    # Be careful about string-like column element types (e.g., InlineStrings/String31)
+    obs_id_col = String.(df.observable_id)
+    cond_id_col = String.(hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id)
+    t_col = Float64.(df.time)
+
+    # pSTAT1
+    mask_pS1 = (obs_id_col .== "obs_total_pS1") .&
+               (cond_id_col .== String(norm_cond_id)) .&
+               (abs.(t_col .- 20.0) .< 0.01)
+    r_pS1 = findfirst(mask_pS1)
+    
+    if !isnothing(r_pS1)
+        maprow = mi.xindices.mapxobservable[r_pS1]
+        pS1_model_20 = PEtab._h(u_t20, 20.0, norm_sol.prob.p, xobs_ps, xnond_ps, 
+                               mi.model.h, maprow, df.observable_id[r_pS1], 
+                               mi.petab_parameters.nominal_value)
+    end
+    
+    # pSTAT3
+    mask_pS3 = (obs_id_col .== "obs_total_pS3") .&
+               (cond_id_col .== String(norm_cond_id)) .&
+               (abs.(t_col .- 20.0) .< 0.01)
+    r_pS3 = findfirst(mask_pS3)
+    
+    if !isnothing(r_pS3)
+        maprow = mi.xindices.mapxobservable[r_pS3]
+        pS3_model_20 = PEtab._h(u_t20, 20.0, norm_sol.prob.p, xobs_ps, xnond_ps, 
+                               mi.model.h, maprow, df.observable_id[r_pS3], 
+                               mi.petab_parameters.nominal_value)
+    end
+
+    # If we can't even locate the normalization rows, the NLLH computation is invalid.
+    # Returning a constant penalty here hides the bug and makes all NLLHs identical.
+    if isnothing(r_pS1) || isnothing(r_pS3)
+        return (Inf, NaN)
+    end
     
     # Get experimental values at t=20 from normalization condition
     norm_meas = filter(row -> 
@@ -706,9 +836,9 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
     pS1_exp_val = Float64(first(pS1_exp_20).measurement)
     pS3_exp_val = Float64(first(pS3_exp_20).measurement)
     
-    # Compute scaling factors
-    if pS1_model_20 < 1e-12 || pS3_model_20 < 1e-12
-        return Inf  # Model values too small
+    # Compute scaling factors (match objective semantics: invalid region => Inf)
+    if pS1_model_20 <= 1e-12 || pS3_model_20 <= 1e-12
+        return (Inf, NaN)
     end
     
     sf_pSTAT1 = pS1_exp_val / pS1_model_20
@@ -716,6 +846,11 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
     
     # Now compute NLLH with scaling
     nllh = 0.0
+    sse = 0.0
+
+    obs_col_df = df.observable_id
+    cond_col_df = hasproperty(df, :simulation_id) ? df.simulation_id : df.simulation_condition_id
+    time_col_df = df.time
     
     for row in eachrow(measurements_df)
         cond_id = row.simulationConditionId
@@ -726,19 +861,29 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
         # Get solution for this condition
         sol = ode_solutions[Symbol(cond_id)]
         if !(sol.retcode == :Success || string(sol.retcode) == "Success")
-            return Inf
+            return (Inf, NaN)
         end
         
         # Interpolate to measurement time
         u_t = sol(time)
-        
-        # Get model observable value
+
+        # Evaluate observable via PEtab mapping (consistent with optimized NLLH)
+        mask = (String.(obs_col_df) .== String(obs_id)) .&
+               (String.(cond_col_df) .== String(cond_id)) .&
+               (abs.(Float64.(time_col_df) .- time) .< 0.01)
+        r = findfirst(mask)
+        if isnothing(r)
+            return (Inf, NaN)
+        end
+        maprow = mi.xindices.mapxobservable[r]
+        model_val = PEtab._h(u_t, time, sol.prob.p, xobs_ps, xnond_ps,
+                             mi.model.h, maprow, obs_col_df[r],
+                             mi.petab_parameters.nominal_value)
+
         if contains(obs_id, "pS1")
-            model_val = u_t[end-1]
             sf = sf_pSTAT1
             sigma = sigma_pSTAT1
         else
-            model_val = u_t[end]
             sf = sf_pSTAT3
             sigma = sigma_pSTAT3
         end
@@ -748,15 +893,21 @@ function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_condit
         
         # Proportional noise: sigma * (prediction + 0.01)
         noise_std = sigma * (prediction + 0.01)
+
+        if !(noise_std > 0)
+            return (Inf, NaN)
+        end
         
-        # Gaussian NLLH: 0.5 * (residual/σ)² + log(σ) + 0.5*log(2π)
+        # Gaussian NLLH: 0.5 * (residual/sigma)^2 + log(sigma) + 0.5*log(2pi)
         residual = measurement - prediction
+        sse += residual^2
+        
         nllh += 0.5 * (residual / noise_std)^2
         nllh += log(noise_std)
-        nllh += 0.5 * log(2π)
+        nllh += 0.5 * log(2pi)
     end
     
-    return nllh
+    return (nllh, sse)
 end
 
 """

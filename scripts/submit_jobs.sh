@@ -12,12 +12,10 @@ echo "Submitting jobs for user: $EMAIL"
 
 # Usage examples (uncomment or run manually):
 # sbatch --mail-user="$EMAIL" submit_array.sh
-# sbatch --mail-user="$EMAIL" --dependency=afterok:<JOBID> submit_collate.sh
+ARRAY_JOBID=$(sbatch --mail-user="$EMAIL" scripts/submit_array.sh | awk '{print $4}')
+echo "Submitted array job: $ARRAY_JOBID"
 
-# echo "To submit the array job, run:"
-# echo "sbatch --mail-user=\"$EMAIL\" submit_array.sh"
-
-sbatch --mail-user="$EMAIL" scripts/submit_array.sh
-sbatch --mail-user="$EMAIL" --dependency=afterok:<JOBID> scripts/submit_collate.sh
+COLLATE_JOBID=$(sbatch --mail-user="$EMAIL" --dependency=afterok:${ARRAY_JOBID} scripts/submit_collate.sh | awk '{print $4}')
+echo "Submitted collate job (afterok): $COLLATE_JOBID"
 
 

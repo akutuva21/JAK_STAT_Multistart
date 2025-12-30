@@ -9,12 +9,15 @@ using Optimization, Optim, OptimizationOptimJL
 using SymbolicUtils, Symbolics
 using Random
 using OrdinaryDiffEq  # For QNDF solver
+using ForwardDiff
+
+include(joinpath(@__DIR__, "python_compatible_nllh.jl"))
 
 # ============================================================================
 # CONFIGURATION - Edit paths as needed
 # ============================================================================
-const MODEL_NET = joinpath(@__DIR__, "variable_JAK_STAT_SOCS_degrad_model.net")
-const PETAB_DIR = joinpath(@__DIR__, "petab_files")
+const MODEL_NET = joinpath(@__DIR__, "..", "variable_JAK_STAT_SOCS_degrad_model.net")
+const PETAB_DIR = joinpath(@__DIR__, "..", "petab_files")
 
 const MEASUREMENTS_FILE = joinpath(PETAB_DIR, "measurements.tsv")
 const CONDITIONS_FILE = joinpath(PETAB_DIR, "conditions.tsv")
@@ -181,8 +184,37 @@ end
 
 function run_multistart(n_starts=10; max_iterations=1000)
     petab_problem = load_petab_from_files()
-    
-    optimizer = Optim.IPNewton()
+
+    # Determine normalization condition id and the PEtab row indices used to compute scaling factors.
+    # (Matches python/parameter_estimator.py: normalization at L1_0=10, L2_0=0 and t=20)
+    mi = petab_problem.model_info
+
+    # Find normalization condition id from the simulation_conditions stored in the PEtab model
+    norm_cond_id = nothing
+    for (cond_id, cond_dict) in petab_problem.model.simulation_conditions
+        L1_val = get(cond_dict, :L1_0, 0.0)
+        L2_val = get(cond_dict, :L2_0, 0.0)
+        if L1_val == 10.0 && L2_val == 0.0
+            norm_cond_id = String(cond_id)
+            break
+        end
+    end
+    if isnothing(norm_cond_id)
+        error("Could not find normalization condition (L1_0=10, L2_0=0) in conditions.tsv")
+    end
+
+    r_pS1_norm = find_measurement_row_index(mi, "obs_total_pS1", norm_cond_id, 20.0)
+    r_pS3_norm = find_measurement_row_index(mi, "obs_total_pS3", norm_cond_id, 20.0)
+    if isnothing(r_pS1_norm) || isnothing(r_pS3_norm)
+        error("Could not locate normalization measurement rows at t=20 for condition $(norm_cond_id)")
+    end
+
+    custom_nllh = x -> compute_nllh_python_compatible(x, petab_problem, norm_cond_id, r_pS1_norm, r_pS3_norm)
+
+    opt_f = OptimizationFunction(
+        (x, p) -> custom_nllh(x);
+        grad = (G, x, p) -> ForwardDiff.gradient!(G, custom_nllh, x)
+    )
     
     # Generate start guesses
     lb = petab_problem.lower_bounds
@@ -204,16 +236,24 @@ function run_multistart(n_starts=10; max_iterations=1000)
     for (i, p0) in enumerate(startguesses)
         print("Run $i/$n_starts: ")
         try
-            res = calibrate(petab_problem, p0, optimizer; 
-                options=Optim.Options(iterations=max_iterations, show_trace=false))
-            push!(results, res)
-            
-            if !isnan(res.fmin) && res.fmin < best_f
-                best_f = res.fmin
-                best_res = res
-                println("✓ NEW BEST fmin=$(round(res.fmin, digits=4))")
+            opt_prob = OptimizationProblem(opt_f, p0, nothing;
+                lb = petab_problem.lower_bounds,
+                ub = petab_problem.upper_bounds
+            )
+
+            sol = solve(opt_prob, Optim.Fminbox(Optim.LBFGS());
+                maxiters = max_iterations,
+                show_trace = false
+            )
+
+            push!(results, sol)
+
+            if !isnan(sol.objective) && sol.objective < best_f
+                best_f = sol.objective
+                best_res = sol
+                println("✓ NEW BEST fmin=$(round(sol.objective, digits=4))")
             else
-                println("fmin=$(isnan(res.fmin) ? "NaN" : round(res.fmin, digits=4))")
+                println("fmin=$(isnan(sol.objective) ? "NaN" : round(sol.objective, digits=4))")
             end
         catch e
             println("✗ Failed: $(typeof(e))")
@@ -227,16 +267,13 @@ function run_multistart(n_starts=10; max_iterations=1000)
     if !isnothing(best_res) && !isinf(best_f)
         println("Best cost: $best_f")
         println("\nBest parameters:")
-        for (i, (name, val)) in enumerate(zip(petab_problem.θ_names, best_res.xmin))
+        for (i, (name, val)) in enumerate(zip(petab_problem.θ_names, best_res.u))
             println("  $name = $(round(val, digits=6))")
         end
         
         # Save results
         results_file = joinpath(@__DIR__, "optimization_results.csv")
-        results_df = DataFrame(
-            parameter = collect(petab_problem.θ_names),
-            value = best_res.xmin
-        )
+        results_df = DataFrame(parameter = collect(petab_problem.θ_names), value = best_res.u)
         CSV.write(results_file, results_df)
         println("\n💾 Results saved to: $results_file")
     else

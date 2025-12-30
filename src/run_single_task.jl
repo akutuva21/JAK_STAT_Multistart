@@ -16,8 +16,9 @@ using Random
 using JLD2
 using OrdinaryDiffEq  # For QNDF stiff solver
 using SparseArrays
-using LineSearches
 using ForwardDiff
+
+include(joinpath(@__DIR__, "python_compatible_nllh.jl"))
 
 # REQUIRED POLYFILL: findnz for dense matrices
 # PEtab.jl or ModelingToolkit calls findnz on dense Jacobians.
@@ -75,6 +76,9 @@ function parse_commandline()
             help = "Random seed for reproducibility"
             arg_type = Int
             default = 1234
+        "--debug"
+            help = "Enable verbose debug logging (system details, cost/gradient checks)"
+            action = :store_true
     end
     return parse_args(s)
 end
@@ -216,164 +220,8 @@ function load_petab_from_files()
     ), petab_model, sim_conditions
 end
 
-# ============================================================================
-# CUSTOM NLLH WITH ANALYTIC SCALING FACTORS (matches Python exactly)
-# ============================================================================
-"""
-    compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
-
-Compute NLLH with scaling factors computed analytically from normalization condition.
-This matches Python's parameter_estimator.py exactly:
-1. Simulate normalization condition (IL6=10, IL10=0) 
-2. Compute sf = exp_value / model_value at t=20
-3. Compute NLLH with proportional noise: σ * (sf * prediction + 0.01)
-"""
-function compute_nllh_with_scaling(theta, petab_problem, petab_model, sim_conditions, measurements_df)
-    # Get sigma values (fixed parameters, not estimated)
-    sigma_pSTAT1 = 0.15
-    sigma_pSTAT3 = 0.15
-    
-    # Solve all conditions
-    ode_solutions = try
-        PEtab.solve_all_conditions(theta, petab_problem, QNDF(); save_observed_t=true)
-    catch
-        return Inf  # Simulation failed
-    end
-    
-    # Find normalization condition (IL6=10, IL10=0)
-    norm_cond_id = nothing
-    for (cond_id, cond_dict) in sim_conditions
-        L1_val = get(cond_dict, :L1_0, 0.0)
-        L2_val = get(cond_dict, :L2_0, 0.0)
-        if L1_val == 10.0 && L2_val == 0.0
-            norm_cond_id = cond_id
-            break
-        end
-    end
-    
-    if isnothing(norm_cond_id)
-        @warn "Normalization condition (IL6=10, IL10=0) not found"
-        return Inf
-    end
-    
-    # Get model values at t=20 for normalization condition
-    norm_sol = ode_solutions[Symbol(norm_cond_id)]
-    if !(norm_sol.retcode == :Success || string(norm_sol.retcode) == "Success")
-        return Inf  # Simulation failed
-    end
-    
-    # Interpolate to get values at t=20
-    u_t20 = norm_sol(20.0)
-    
-    # Get observable indices - find total_pS1 and total_pS3 in the model
-    model_info = petab_problem.model_info
-    # The observables are typically stored in model_info
-    # Access state indices for total_pS1 and total_pS3
-    state_syms = Symbol.(string.(states(model_info.model.sys)))
-    
-    pS1_idx = findfirst(s -> contains(string(s), "total_pS1"), state_syms)
-    pS3_idx = findfirst(s -> contains(string(s), "total_pS3"), state_syms)
-    
-    # If not found as states, they might be observables - try simulated_values approach
-    pS1_model_20 = NaN
-    pS3_model_20 = NaN
-    
-    # Get simulated values at normalization condition
-    try
-        # Use observed species from model
-        obs_syms = Symbol.(string.(observed(model_info.model.sys)))
-        for (i, obs_sym) in enumerate(obs_syms)
-            obs_str = string(obs_sym)
-            if contains(obs_str, "total_pS1")
-                # Evaluate observable at t=20
-                pS1_model_20 = u_t20[i]
-            elseif contains(obs_str, "total_pS3")
-                pS3_model_20 = u_t20[i]
-            end
-        end
-    catch
-        # Fallback: assume states are directly accessible
-    end
-    
-    # If still NaN, try direct access
-    if isnan(pS1_model_20) || isnan(pS3_model_20)
-        # The observables should be in state vector as observed quantities
-        # Try getting from solution directly
-        pS1_model_20 = u_t20[end-1]  # Assuming total_pS1 is second-to-last
-        pS3_model_20 = u_t20[end]    # Assuming total_pS3 is last
-    end
-    
-    # Get experimental values at t=20 from normalization condition
-    norm_meas = filter(row -> 
-        row.simulationConditionId == norm_cond_id && row.time == 20.0, 
-        measurements_df)
-    
-    pS1_exp_20 = filter(row -> row.observableId == "obs_total_pS1", norm_meas)
-    pS3_exp_20 = filter(row -> row.observableId == "obs_total_pS3", norm_meas)
-    
-    if isempty(pS1_exp_20) || isempty(pS3_exp_20)
-        @warn "Experimental values at normalization condition not found"
-        return Inf
-    end
-    
-    pS1_exp_val = Float64(first(pS1_exp_20).measurement)
-    pS3_exp_val = Float64(first(pS3_exp_20).measurement)
-    
-    # Compute scaling factors
-    if pS1_model_20 < 1e-12 || pS3_model_20 < 1e-12
-        return Inf  # Model values too small
-    end
-    
-    sf_pSTAT1 = pS1_exp_val / pS1_model_20
-    sf_pSTAT3 = pS3_exp_val / pS3_model_20
-    
-    # Now compute NLLH with scaling
-    nllh = 0.0
-    n_datapoints = 0
-    
-    for row in eachrow(measurements_df)
-        cond_id = row.simulationConditionId
-        obs_id = row.observableId
-        time = Float64(row.time)
-        measurement = Float64(row.measurement)
-        
-        # Get solution for this condition
-        sol = ode_solutions[Symbol(cond_id)]
-        if !(sol.retcode == :Success || string(sol.retcode) == "Success")
-            return Inf
-        end
-        
-        # Interpolate to measurement time
-        u_t = sol(time)
-        
-        # Get model observable value (same logic as above for indices)
-        if contains(obs_id, "pS1")
-            model_val = u_t[end-1]  # total_pS1
-            sf = sf_pSTAT1
-            sigma = sigma_pSTAT1
-        else
-            model_val = u_t[end]    # total_pS3
-            sf = sf_pSTAT3
-            sigma = sigma_pSTAT3
-        end
-        
-        # Apply scaling
-        prediction = sf * model_val
-        
-        # Proportional noise: sigma * (prediction + 0.01)
-        noise_std = sigma * (prediction + 0.01)
-        
-        # Gaussian NLLH: 0.5 * (residual/σ)² + log(σ) + 0.5*log(2π)
-        residual = measurement - prediction
-        nllh += 0.5 * (residual / noise_std)^2
-        nllh += log(noise_std)
-        nllh += 0.5 * log(2π)
-        
-        n_datapoints += 1
-    end
-    
-    return nllh
-end
+## NLLH is implemented in src/python_compatible_nllh.jl
+## (compute_nllh_python_compatible)
 
 
 # ============================================================================
@@ -384,6 +232,7 @@ function run_single_task(args)
     n_starts = args["n-starts"]
     max_iter = args["max-iter"]
     seed = args["seed"]
+    debug = get(args, "debug", false)
     
     println("="^60)
     println("SINGLE TASK OPTIMIZATION")
@@ -396,7 +245,11 @@ function run_single_task(args)
     # Load parameters_df for param names
     parameters_df = CSV.read(PARAMETERS_FILE, DataFrame; delim='\t')
     measurements_df = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
-    param_names = parameters_df.parameterId
+    # IMPORTANT: CSV/DataFrames may use InlineStrings for small strings.
+    # Saving InlineStrings into JLD2 makes the artifact hard to load across
+    # environments (and previously caused "There is no UInt type with 32 bytes").
+    # Store plain Strings instead.
+    param_names = String.(parameters_df.parameterId)
     
     # Load problem (returns tuple with additional objects for custom NLLH)
     petab_problem, petab_model, sim_conditions = load_petab_from_files()
@@ -407,59 +260,145 @@ function run_single_task(args)
     
     println("  Parameters: $n_params")
     
-    # Generate ALL start guesses with fixed seed, then pick this task's guess
-    # This ensures reproducibility across all array tasks
+    # Starting point
+    if task_id < 1 || task_id > n_starts
+        error("task-id $(task_id) out of range (1..$(n_starts)). Adjust your Slurm --array and/or --n-starts accordingly.")
+    end
+
+    p0 = similar(lb)
+    # Random multistart (reproducible): generate the task-id'th draw without
+    # materializing all start points in memory.
     Random.seed!(seed)
-    all_startguesses = [lb .+ rand(n_params) .* (ub .- lb) for _ in 1:n_starts]
-    p0 = all_startguesses[task_id]
+    for _ in 1:task_id
+        p0 .= lb .+ rand(n_params) .* (ub .- lb)
+    end
+    println("  Start mode: random")
+    
+    if debug
+        # --- DEBUG: Print system states and observables ---
+        # Note: PEtab.jl versions differ; many expose the ModelingToolkit system as `petab_model.sys`.
+        println("\n--- SYSTEM DEBUG ---")
+        println("PEtabModel type: ", typeof(petab_model))
+        println("PEtabModel fields: ", fieldnames(typeof(petab_model)))
+
+        if hasproperty(petab_model, :sys)
+            sys = getproperty(petab_model, :sys)
+            println("Using petab_model.sys")
+            println("States: ", [string(s) for s in ModelingToolkit.unknowns(sys)])
+            println("Observed: ", [string(o.lhs) for o in ModelingToolkit.observed(sys)])
+        elseif hasproperty(petab_model, :system)
+            sys = getproperty(petab_model, :system)
+            println("Using petab_model.system")
+            println("States: ", [string(s) for s in ModelingToolkit.unknowns(sys)])
+            println("Observed: ", [string(o.lhs) for o in ModelingToolkit.observed(sys)])
+        else
+            println("(Skipping system inspection: no `sys`/`system` field on this PEtabModel)")
+        end
+        println("--------------------\n")
+    end
     
     # Check for existing checkpoint and resume if available
     chkpt_file = joinpath(RESULTS_DIR, "run_$(task_id)_chkpt.jld2")
+    resumed_from_checkpoint = false
     if isfile(chkpt_file)
         try
             chkpt = JLD2.load(chkpt_file)
             p0 = chkpt["xmin"]
             prev_iter = get(chkpt, "iteration", 0)
             prev_fmin = get(chkpt, "fmin", NaN)
-            println("  📁 Resuming from checkpoint: iter=$prev_iter, fmin=$prev_fmin")
+            println("  ?? Resuming from checkpoint: iter=$prev_iter, fmin=$prev_fmin")
+            resumed_from_checkpoint = true
         catch e
-            println("  ⚠️ Failed to load checkpoint, starting fresh: $e")
+            println("  ?? Failed to load checkpoint, starting fresh: $e")
         end
     end
     
-    # DIAGNOSTIC: Test cost function at nominal (middle of bounds) and sampled point
+    # Nominal point (middle of bounds)
     nominal = (lb .+ ub) ./ 2
-    custom_nllh = x -> compute_nllh_with_scaling(x, petab_problem, petab_model, sim_conditions, measurements_df)
-    
-    println("\n--- DIAGNOSTIC (using custom NLLH with analytic scaling) ---")
-    try
-        cost_nominal = custom_nllh(nominal)
-        println("  Cost at nominal parameters: $cost_nominal")
-    catch e
-        println("  Cost at nominal FAILED: $e")
-    end
-    try
-        cost_p0 = custom_nllh(p0)
-        println("  Cost at sampled p0: $cost_p0")
-    catch e
-        println("  Cost at p0 FAILED: $e")
-    end
-    println("  p0 range: min=$(minimum(p0)), max=$(maximum(p0))")
-    
-    # Check gradient at p0
-    try
-        g = ForwardDiff.gradient(custom_nllh, p0)
-        if any(isnan, g)
-            println("  WARNING: Gradient at p0 contains NaNs! Optimization will likely fail.")
-        else
-            println("  Gradient at p0: OK (Range: $(minimum(g)) to $(maximum(g)))")
+    # Determine normalization logic ONCE (outside optimization loop)
+    # Find normalization condition (IL6=10, IL10=0)
+    norm_cond_id = nothing
+    for (cond_id, cond_dict) in sim_conditions
+        L1_val = get(cond_dict, :L1_0, 0.0)
+        L2_val = get(cond_dict, :L2_0, 0.0)
+        if L1_val == 10.0 && L2_val == 0.0
+            norm_cond_id = cond_id
+            break
         end
-    catch e
-        println("  Gradient check FAILED: $e")
-        println("  (Check if ForwardDiff is loaded and compatible)")
+    end
+
+    if isnothing(norm_cond_id)
+        error("Could not find normalization condition (L1_0=10, L2_0=0) in conditions.tsv")
     end
     
-    println("------------------\n")
+    # Locate the PEtab measurement rows that correspond to normalization at t=20
+    mi = petab_problem.model_info
+    r_pS1_norm = find_measurement_row_index(mi, "obs_total_pS1", String(norm_cond_id), 20.0)
+    r_pS3_norm = find_measurement_row_index(mi, "obs_total_pS3", String(norm_cond_id), 20.0)
+
+    if isnothing(r_pS1_norm) || isnothing(r_pS3_norm)
+        error("Could not locate normalization measurement rows at t=20 for condition $(norm_cond_id)")
+    end
+
+    nominal = (lb .+ ub) ./ 2
+    custom_nllh = x -> compute_nllh_python_compatible(x, petab_problem, String(norm_cond_id), r_pS1_norm, r_pS3_norm)
+
+    # IMPORTANT: Python returns np.inf for invalid scaling (near-zero model at t=20).
+    # LBFGS + ForwardDiff cannot make progress from an Inf objective (gradient becomes 0).
+    # So for random multistarts, resample until we find a finite objective.
+    if !resumed_from_checkpoint
+        max_tries = 200
+        cost_p0_try = custom_nllh(p0)
+        if !isfinite(cost_p0_try)
+            println("  Start point has non-finite cost (Inf/NaN). Resampling p0 up to $max_tries tries...")
+            found = false
+            for attempt in 1:max_tries
+                p0 .= lb .+ rand(n_params) .* (ub .- lb)
+                cost_p0_try = custom_nllh(p0)
+                if isfinite(cost_p0_try)
+                    println("  Found finite start after $attempt resamples: cost = $cost_p0_try")
+                    found = true
+                    break
+                end
+            end
+            if !found
+                println("  WARNING: Could not find a finite random start after $max_tries tries; falling back to nominal start")
+                p0 .= nominal
+            end
+        end
+    end
+    
+    if debug
+        println("\n--- DIAGNOSTIC (using custom NLLH with analytic scaling) ---")
+        try
+            cost_nominal = custom_nllh(nominal)
+            println("  Cost at nominal parameters: $cost_nominal")
+        catch e
+            println("  Cost at nominal FAILED: $e")
+        end
+        try
+            cost_p0 = custom_nllh(p0)
+            println("  Cost at sampled p0: $cost_p0")
+        catch e
+            println("  Cost at p0 FAILED: $e")
+        end
+        println("  p0 range: min=$(minimum(p0)), max=$(maximum(p0))")
+
+        # Check gradient at p0
+        try
+            g = ForwardDiff.gradient(custom_nllh, p0)
+            if any(isnan, g)
+                println("  WARNING: Gradient at p0 contains NaNs! Optimization will likely fail.")
+            else
+                println("  Gradient at p0: OK (Range: $(minimum(g)) to $(maximum(g)))")
+            end
+        catch e
+            println("  Gradient check FAILED: $e")
+            println("  (Check if ForwardDiff is loaded and compatible)")
+        end
+
+        println("------------------\n")
+    end
     
     println("Starting optimization for task $task_id...")
     
@@ -480,7 +419,7 @@ function run_single_task(args)
         iter_count[] += 1
         
         # Print progress every 10 iterations
-        if iter_count[] % 10 == 0
+        if debug && iter_count[] % 10 == 0
             println("  [Iter $(iter_count[])] Loss = $loss")
         end
         
@@ -498,7 +437,9 @@ function run_single_task(args)
                 "param_names" => param_names
             ))
             last_checkpoint_iter[] = iter_count[]
-            println("  [Iter $(iter_count[])] Saved checkpoint: fmin = $loss")
+            if debug
+                println("  [Iter $(iter_count[])] Saved checkpoint: fmin = $loss")
+            end
         end
         
         return false  # Continue optimization
@@ -512,8 +453,11 @@ function run_single_task(args)
     try
         # Build OptimizationFunction with CUSTOM NLLH that uses analytic scaling factors
         # This matches Python's parameter_estimator.py exactly
-        custom_nllh = x -> compute_nllh_with_scaling(x, petab_problem, petab_model, sim_conditions, measurements_df)
-        
+        # Build OptimizationFunction with CUSTOM NLLH that uses analytic scaling factors
+        # This matches Python's parameter_estimator.py exactly
+        # Python-compatible NLLH (normalization scaling at t=20, proportional noise)
+        custom_nllh = x -> compute_nllh_python_compatible(x, petab_problem, String(norm_cond_id), r_pS1_norm, r_pS3_norm)
+
         opt_f = OptimizationFunction(
             (x, p) -> custom_nllh(x);
             grad = (G, x, p) -> ForwardDiff.gradient!(G, custom_nllh, x)
@@ -532,14 +476,16 @@ function run_single_task(args)
         # f_tol=1e-4: accept solution when function change is small
         # g_tol=1e-2: accept solution when gradient is small (very relaxed)
         # x_tol=1e-4: accept when parameters stop changing
-        sol = solve(opt_prob, Optim.Fminbox(Optim.LBFGS()); 
+        # Use BackTracking line search: more robust when trial steps hit non-finite
+        # objective values (common here due to the Python-matching normalization rule).
+        sol = solve(opt_prob, Optim.Fminbox(Optim.LBFGS(linesearch = Optim.LineSearches.BackTracking())); 
             maxiters = max_iter,
             maxtime = 3300.0,  # 55 minutes (5 min buffer for saving)
             callback = opt_callback,
             f_tol = 1e-4,
             g_tol = 1e-2,
-            x_tol = 1e-4,
-            show_trace = true
+            x_abstol = 1e-4,
+            show_trace = debug
         )
         
         println("  Optimization finished!")
@@ -589,7 +535,7 @@ function run_single_task(args)
         rm(chkpt_file)
     end
     
-    println("\n✅ Task $task_id complete. Saved to: $output_file")
+    println("\n? Task $task_id complete. Saved to: $output_file")
     
     return result
 end
@@ -598,6 +544,15 @@ end
 # MAIN
 # ============================================================================
 if abspath(PROGRAM_FILE) == @__FILE__
-    args = parse_commandline()
-    run_single_task(args)
+    try
+        args = parse_commandline()
+        run_single_task(args)
+    catch
+        println("\nFATAL: run_single_task crashed")
+        for (exc, bt) in Base.catch_stack()
+            showerror(stdout, exc, bt)
+            println()
+        end
+        exit(1)
+    end
 end

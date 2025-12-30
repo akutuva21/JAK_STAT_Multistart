@@ -69,7 +69,10 @@ const PTEMPEST_PARAMS = joinpath(DATA_DIR, "param_sets.csv")
 const RESULT_FILE = find_result_file()
 
 # Create plots directory
-const PLOT_DIR = joinpath(@__DIR__, "..", "final_results_plots", "ptempest_comparison")
+# IMPORTANT: Use the *current working directory* so this works on cluster scratch.
+# In Slurm runs we `cd $SCRDIR` before executing, so plots land in "$SCRDIR/final_results_plots/..."
+# and the submit script can rsync them back reliably.
+const PLOT_DIR = get(ENV, "PTEMPEST_PLOT_DIR", joinpath(pwd(), "final_results_plots", "ptempest_comparison"))
 
 # PEtab/Model files
 const MODEL_NET, PETAB_DIR = find_model_files()
@@ -494,10 +497,6 @@ function plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
     plot!(p2, time_points, q05_traj3, color=:blue, linewidth=1.5, linestyle=:dash, 
           label="pTempest 5-95%")
     plot!(p2, time_points, q95_traj3, color=:blue, linewidth=1.5, linestyle=:dash, label="")
-    
-    # Add horizontal line at pTempest max for reference
-    hline!(p2, [ymax_ptempest], color=:orange, linewidth=1.5, linestyle=:dot,
-           label="pTempest Max")
     
     # Plot best fit
     scatter!(p2, times_pS3, best_pstat3, color=:red, markersize=8, 

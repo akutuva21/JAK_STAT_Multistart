@@ -45,7 +45,7 @@ This repository contains the codebase for running multistart parameter estimatio
 | `pSTAT3_trajs.csv` | pTempest trajectory samples for pSTAT3. |
 | `pSTAT1_pooled_data.xlsx` | Pooled experimental data for pSTAT1. |
 | `pSTAT3_pooled_data.xlsx` | Pooled experimental data for pSTAT3. |
-| `param_sets.csv` | Pre-generated parameter sets for multistart. |
+| `param_sets.csv` | pTempest parameter sets (used only for comparison/benchmarking). |
 
 ### PEtab Files (`petab_files/`)
 
