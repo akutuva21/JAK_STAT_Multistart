@@ -12,6 +12,9 @@ using OrdinaryDiffEq
 using Symbolics
 using SymbolicUtils
 
+# Use the same Python-compatible NLLH as optimization/collate
+include(joinpath(@__DIR__, "python_compatible_nllh.jl"))
+
 # ============================================================================
 # CONFIGURATION
 # ============================================================================
@@ -89,6 +92,31 @@ const TARGET_L2 = 0.0   # IL-10 concentration
 # HELPER FUNCTIONS
 # ============================================================================
 
+function get_normalization_condition_id()
+    conditions = CSV.read(CONDITIONS_FILE, DataFrame; delim='\t')
+    mask = (conditions.L1_0 .== TARGET_L1) .& (conditions.L2_0 .== TARGET_L2)
+    idx = findfirst(mask)
+    if isnothing(idx)
+        error("No condition found with L1_0=$(TARGET_L1), L2_0=$(TARGET_L2) in $(CONDITIONS_FILE)")
+    end
+    # Force plain String for portability (CSV may produce InlineStrings/String31)
+    return String(conditions.conditionId[idx])
+end
+
+function get_measurement_value(obs_id::AbstractString, cond_id::AbstractString, time::Float64)
+    measurements = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
+    obs_id_s = String(obs_id)
+    cond_id_s = String(cond_id)
+    mask = (String.(measurements.observableId) .== obs_id_s) .&
+           (String.(measurements.simulationConditionId) .== cond_id_s) .&
+           (abs.(measurements.time .- time) .< 1e-9)
+    idx = findfirst(mask)
+    if isnothing(idx)
+        error("No measurement found for obs=$(obs_id_s), condition=$(cond_id_s), time=$(time)")
+    end
+    return Float64(measurements.measurement[idx])
+end
+
 function load_ptempest_trajectories()
     println("Loading pTempest trajectories...")
     
@@ -131,33 +159,46 @@ function load_ptempest_trajectories()
     println("  Loaded $(nrow(pstat1_filtered)) trajectories for IL-6 $(Int(TARGET_L1)) ng/mL condition")
     println("  Time range: 0 to $(n_timepoints-1) minutes")
     
-    # NORMALIZE pTempest Data to match our model's normalization (t=20 min = 1.0)
-    # Our model is normalized to IL6=10 @ 20min ≈ 1.0
-    # pTempest is in absolute units (uM), so we must normalize it to compare DYNAMICS
-    
+    # SCALE pTempest trajectories using the same convention as collect_results.jl:
+    # compute analytic scale factors from the normalization condition (IL6=10, IL10=0)
+    # so that the model value at t=20 matches the PEtab measurement value at t=20.
+    norm_cond_id = get_normalization_condition_id()
+    exp_pS1_t20 = get_measurement_value("obs_total_pS1", norm_cond_id, 20.0)
+    exp_pS3_t20 = get_measurement_value("obs_total_pS3", norm_cond_id, 20.0)
+
     # Find t=20 index (assuming 1-min steps starting at 0, index 21 is t=20)
     t20_idx = findfirst(==(20.0), time_points)
     if isnothing(t20_idx)
-        println("  Warning: t=20 not found in pTempest time points. Using peak for normalization.")
-        t20_idx = argmax(vec(median(Matrix(pstat3_filtered), dims=1)))
+        error("t=20 not found in pTempest time points (expected 0:1:...).")
     end
-    
-    # Calculate median value at t=20 for normalization
+
     pS1_vals = Matrix(pstat1_filtered)
     pS3_vals = Matrix(pstat3_filtered)
-    
-    med_pS1_t20 = median(pS1_vals[:, t20_idx])
-    med_pS3_t20 = median(pS3_vals[:, t20_idx])
-    
-    println("  Normalizing pTempest to median @ t=20:")
-    println("    pSTAT1 median @ 20min: $med_pS1_t20 -> 1.0")
-    println("    pSTAT3 median @ 20min: $med_pS3_t20 -> 1.0")
-    
-    # Create normalized DataFrames
-    pS1_norm = DataFrame(pS1_vals ./ med_pS1_t20, :auto)
-    pS3_norm = DataFrame(pS3_vals ./ med_pS3_t20, :auto)
-    
-    return time_points, pS1_norm, pS3_norm, n_filtered
+
+    pS1_t20 = pS1_vals[:, t20_idx]
+    pS3_t20 = pS3_vals[:, t20_idx]
+
+    # Drop trajectories that can't be scaled (t=20 <= 0)
+    valid = (pS1_t20 .> 0.0) .& (pS3_t20 .> 0.0) .& isfinite.(pS1_t20) .& isfinite.(pS3_t20)
+    n_valid = sum(valid)
+    if n_valid == 0
+        error("All pTempest trajectories have non-positive/invalid values at t=20; cannot scale.")
+    end
+    if n_valid != n_filtered
+        println("  Note: Dropping $(n_filtered - n_valid) trajectories with invalid t=20 for scaling")
+    end
+
+    sf_pS1 = exp_pS1_t20 ./ pS1_t20[valid]
+    sf_pS3 = exp_pS3_t20 ./ pS3_t20[valid]
+
+    pS1_scaled = pS1_vals[valid, :] .* reshape(sf_pS1, :, 1)
+    pS3_scaled = pS3_vals[valid, :] .* reshape(sf_pS3, :, 1)
+
+    println("  Scaling pTempest using PEtab t=20 measurements (condition=$(norm_cond_id)):")
+    println("    pSTAT1 exp@20: $(exp_pS1_t20)")
+    println("    pSTAT3 exp@20: $(exp_pS3_t20)")
+
+    return time_points, DataFrame(pS1_scaled, :auto), DataFrame(pS3_scaled, :auto), n_valid
 end
 
 function load_best_parameters()
@@ -178,6 +219,20 @@ function load_best_parameters()
     println("  Loaded $(length(best_params)) parameters")
     
     return best_params, best_params_df
+end
+
+function build_theta_from_best_params(petab_problem::PEtab.PEtabODEProblem, best_params::Dict{String, Float64})
+    # best_params values are already in log10 scale
+    param_names = string.(petab_problem.xnames)
+    theta = Vector{Float64}(undef, length(param_names))
+    for (i, name) in enumerate(param_names)
+        if haskey(best_params, name)
+            theta[i] = best_params[name]
+        else
+            theta[i] = Float64(petab_problem.xnominal[i])
+        end
+    end
+    return theta
 end
 
 function load_petab_problem()
@@ -331,34 +386,15 @@ function simulate_with_petab(best_params)
     
     # Load measurements to get time/condition info
     measurements = CSV.read(MEASUREMENTS_FILE, DataFrame; delim='\t')
-    
-    # Find the high IL6 condition (IL6=10, IL10=0)
-    conditions = CSV.read(CONDITIONS_FILE, DataFrame; delim='\t')
-    println("  Available conditions: ", conditions.conditionId)
-    
-    # Find condition with IL6=10, IL10=0 - look for cond_il6_10
-    high_il6_cond = nothing
-    for cid in conditions.conditionId
-        cid_str = string(cid)
-        # Match "cond_il6_10" but NOT "cond_il6_10_il10_X"
-        if cid_str == "cond_il6_10" || (occursin("il6_10", cid_str) && !occursin("il10", cid_str))
-            high_il6_cond = cid_str
-            break
-        end
-    end
-    
-    if isnothing(high_il6_cond)
-        # Fallback: just use first condition with high IL6
-        high_il6_cond = string(conditions.conditionId[1])
-        println("  Warning: Could not find IL6=10, IL10=0 condition, using $high_il6_cond")
-    end
-    
-    println("  Using condition: $high_il6_cond")
+
+    # Use the exact normalization condition defined by conditions.tsv
+    norm_cond_id = get_normalization_condition_id()
+    println("  Using normalization condition: $norm_cond_id (L1=$(TARGET_L1), L2=$(TARGET_L2))")
     
     # Extract trajectories for this condition
-    mask_pS1 = (measurements.simulationConditionId .== high_il6_cond) .& 
+    mask_pS1 = (measurements.simulationConditionId .== norm_cond_id) .& 
                (measurements.observableId .== "obs_total_pS1")
-    mask_pS3 = (measurements.simulationConditionId .== high_il6_cond) .& 
+    mask_pS3 = (measurements.simulationConditionId .== norm_cond_id) .& 
                (measurements.observableId .== "obs_total_pS3")
     
     times_pS1 = measurements.time[mask_pS1]
@@ -384,39 +420,34 @@ function simulate_with_petab(best_params)
         error("Simulation returned no values for pSTAT1!")
     end
     
-    # Paper doesn't use scale factors - simulated values are directly the model outputs
-    # which are normalized to IL-6 10ng/mL @ t=20
-    # For comparison with pTempest, we re-normalize to t=20 exactly
-    
-    # Find t=20 indices
+    # Scale to PEtab measurement units using analytic t=20 normalization (same as collate)
+    exp_pS1_t20 = get_measurement_value("obs_total_pS1", norm_cond_id, 20.0)
+    exp_pS3_t20 = get_measurement_value("obs_total_pS3", norm_cond_id, 20.0)
+
     idx_t20_pS1 = findfirst(t -> abs(t - 20.0) < 0.1, times_pS1)
     idx_t20_pS3 = findfirst(t -> abs(t - 20.0) < 0.1, times_pS3)
-    
-    println("  DEBUG: t=20 indices: pS1=$idx_t20_pS1, pS3=$idx_t20_pS3")
-    
-    # Robust normalization: fall back to max if t=20 is missing or zero
-    val_t20_pS1 = !isnothing(idx_t20_pS1) ? sim_pS1[idx_t20_pS1] : 0.0
-    val_t20_pS3 = !isnothing(idx_t20_pS3) ? sim_pS3[idx_t20_pS3] : 0.0
-    
-    norm_factor_pS1 = (val_t20_pS1 > 1e-9) ? val_t20_pS1 : maximum(sim_pS1)
-    norm_factor_pS3 = (val_t20_pS3 > 1e-9) ? val_t20_pS3 : maximum(sim_pS3)
-    
-    # Avoid division by zero
-    norm_factor_pS1 = max(norm_factor_pS1, 1e-9)
-    norm_factor_pS3 = max(norm_factor_pS3, 1e-9)
-    
-    raw_pS1 = sim_pS1 ./ norm_factor_pS1
-    raw_pS3 = sim_pS3 ./ norm_factor_pS3
-    
+    if isnothing(idx_t20_pS1) || isnothing(idx_t20_pS3)
+        error("Could not find t=20 in simulated time points (pS1 idx=$(idx_t20_pS1), pS3 idx=$(idx_t20_pS3))")
+    end
+
+    model_pS1_t20 = sim_pS1[idx_t20_pS1]
+    model_pS3_t20 = sim_pS3[idx_t20_pS3]
+    if !(isfinite(model_pS1_t20) && isfinite(model_pS3_t20)) || model_pS1_t20 <= 0.0 || model_pS3_t20 <= 0.0
+        error("Invalid model values at t=20 for scaling (pS1=$(model_pS1_t20), pS3=$(model_pS3_t20))")
+    end
+
+    sf_pS1 = exp_pS1_t20 / model_pS1_t20
+    sf_pS3 = exp_pS3_t20 / model_pS3_t20
+
+    scaled_pS1 = sim_pS1 .* sf_pS1
+    scaled_pS3 = sim_pS3 .* sf_pS3
+
     println("  Simulated $(length(sim_pS1)) pSTAT1 points, $(length(sim_pS3)) pSTAT3 points")
-    println("  Re-normalization factors (model val @ t=20):")
-    println("    pS1: $(val_t20_pS1) -> used factor $(norm_factor_pS1)")
-    println("    pS3: $(val_t20_pS3) -> used factor $(norm_factor_pS3)")
-    println("  Normalized ranges:")
-    println("    pSTAT1: $(minimum(raw_pS1)) - $(maximum(raw_pS1))")
-    println("    pSTAT3: $(minimum(raw_pS3)) - $(maximum(raw_pS3))")
-    
-    return times_pS1, raw_pS1, times_pS3, raw_pS3
+    println("  Analytic scale factors (match exp at t=20):")
+    println("    pS1: model@20=$(model_pS1_t20), exp@20=$(exp_pS1_t20) => sf=$(sf_pS1)")
+    println("    pS3: model@20=$(model_pS3_t20), exp@20=$(exp_pS3_t20) => sf=$(sf_pS3)")
+
+    return times_pS1, scaled_pS1, times_pS3, scaled_pS3
 end
 
 function plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
@@ -440,7 +471,7 @@ function plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
     
     # --- pSTAT1 ---
     p1 = plot(title="pSTAT1", 
-              xlabel="Time (min)", ylabel="Normalized pSTAT1",
+              xlabel="Time (min)", ylabel="pSTAT1 (scaled to PEtab)",
               legend=:topright, size=(800, 600), titlefontsize=12)
     
     # Plot pTempest ensemble (subsample to avoid overplotting)
@@ -476,7 +507,7 @@ function plot_trajectory_overlay(time_points, ptempest_pstat1, ptempest_pstat3,
     ymax_plot = max(ymax_ptempest * 1.1, best_peak3 * 1.1)
     
     p2 = plot(title="pSTAT3", 
-              xlabel="Time (min)", ylabel="Normalized pSTAT3",
+              xlabel="Time (min)", ylabel="pSTAT3 (scaled to PEtab)",
               legend=:topright, size=(800, 600), titlefontsize=12,
               ylim=(0, ymax_plot))
     
@@ -739,6 +770,16 @@ function compute_ptempest_nllh(unique_sets::DataFrame)
     # Load PEtab problem using the same function as trajectory comparison
     println("Loading PEtab problem...")
     petab_problem = load_petab_problem()
+
+    # Normalization condition + rows (needed for Python-compatible scaling)
+    norm_cond_id = get_normalization_condition_id()
+    r_pS1_norm = find_measurement_row_index(petab_problem.model_info, "obs_total_pS1", norm_cond_id, 20.0; atol=1e-9)
+    r_pS3_norm = find_measurement_row_index(petab_problem.model_info, "obs_total_pS3", norm_cond_id, 20.0; atol=1e-9)
+    if isnothing(r_pS1_norm) || isnothing(r_pS3_norm)
+        error("Could not locate normalization rows in PEtab measurement table for condition=$(norm_cond_id) at t=20")
+    end
+    r_pS1_norm = Int(r_pS1_norm)
+    r_pS3_norm = Int(r_pS3_norm)
     
     # Get parameter names from PEtab
     petab_param_ids = string.(petab_problem.xnames)
@@ -771,18 +812,18 @@ function compute_ptempest_nllh(unique_sets::DataFrame)
                         if linear_val > 0
                             theta[j] = log10(linear_val)
                         else
-                            theta[j] = -6.0  # Default for zero/negative values
+                            theta[j] = Float64(petab_problem.xnominal[j])
                         end
                     else
-                        theta[j] = 0.0  # Default if not found
+                        theta[j] = Float64(petab_problem.xnominal[j])
                     end
                 else
-                    theta[j] = 0.0  # Default for unmapped parameters
+                    theta[j] = Float64(petab_problem.xnominal[j])
                 end
             end
             
-            # Compute NLLH using PEtab cost function
-            nllh = petab_problem.nllh(theta)
+            # Compute NLLH using the same Python-compatible objective used in optimization/collate
+            nllh = compute_nllh_python_compatible(theta, petab_problem, String(norm_cond_id), r_pS1_norm, r_pS3_norm)
             
             if isfinite(nllh)
                 push!(nllh_values, nllh)
@@ -940,15 +981,26 @@ function main(;run_nllh_comparison::Bool=true, run_trajectory_comparison::Bool=f
     end
     
     if run_nllh_comparison
+        # Load PEtab problem once
+        petab_problem = load_petab_problem()
+
         # Load unique pTempest parameter sets
         unique_sets = load_unique_ptempest_params()
         
         # Compute NLLH for each pTempest parameter set
         ptempest_nllh = compute_ptempest_nllh(unique_sets)
-        
-        # Our best NLLH (from optimization)
-        # Note: This is read from the log - in a real setup, read from best_parameters.csv summary
-        our_best_nllh = -79.31  # From collate output
+
+        # Our best NLLH computed with the same Python-compatible objective
+        best_params, _ = load_best_parameters()
+        theta_best = build_theta_from_best_params(petab_problem, best_params)
+
+        norm_cond_id = get_normalization_condition_id()
+        r_pS1_norm = find_measurement_row_index(petab_problem.model_info, "obs_total_pS1", norm_cond_id, 20.0; atol=1e-9)
+        r_pS3_norm = find_measurement_row_index(petab_problem.model_info, "obs_total_pS3", norm_cond_id, 20.0; atol=1e-9)
+        if isnothing(r_pS1_norm) || isnothing(r_pS3_norm)
+            error("Could not locate normalization rows in PEtab measurement table for condition=$(norm_cond_id) at t=20")
+        end
+        our_best_nllh = compute_nllh_python_compatible(theta_best, petab_problem, String(norm_cond_id), Int(r_pS1_norm), Int(r_pS3_norm))
         
         # Generate comparison plots
         plot_nllh_distribution(ptempest_nllh, our_best_nllh)
